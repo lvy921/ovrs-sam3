@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import fields, is_dataclass
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -29,203 +29,110 @@ def move_batch_to_device(obj, device: torch.device):
     return obj
 
 
-@dataclass
-class BinarySemanticMetrics:
-    pixel_acc: float
-    iou: float
-    dice: float
-
-
-class BinarySemanticEvaluator:
-    def __init__(self, threshold: float = 0.5):
-        self.threshold = float(threshold)
+class MulticlassSemanticEvaluator:
+    def __init__(self, ignore_index: int = 255):
+        self.ignore_index = int(ignore_index)
+        self.num_classes: Optional[int] = None
         self.reset()
 
     def reset(self):
-        self.intersection = 0.0
-        self.union = 0.0
+        self.intersection = None
+        self.union = None
+        self.target_count = None
         self.correct = 0.0
         self.total = 0.0
-        self.pred_sum = 0.0
-        self.target_sum = 0.0
 
-    @staticmethod
-    def _prepare_target(semantic_masks: torch.Tensor, out_hw: Tuple[int, int], device: torch.device) -> torch.Tensor:
-        if semantic_masks.dim() == 2:
-            semantic_masks = semantic_masks[None, None]
-        elif semantic_masks.dim() == 3:
-            semantic_masks = semantic_masks[:, None]
-        elif semantic_masks.dim() == 4 and semantic_masks.shape[1] != 1:
-            semantic_masks = semantic_masks.any(dim=1, keepdim=True)
-        semantic_masks = semantic_masks.float().to(device)
-        if semantic_masks.shape[-2:] != out_hw:
-            semantic_masks = F.interpolate(semantic_masks, size=out_hw, mode='nearest')
-        return semantic_masks
+    def _ensure_buffers(self, num_classes: int, device: torch.device):
+        if self.num_classes is None:
+            self.num_classes = num_classes
+            self.intersection = torch.zeros(num_classes, dtype=torch.float64, device=device)
+            self.union = torch.zeros(num_classes, dtype=torch.float64, device=device)
+            self.target_count = torch.zeros(num_classes, dtype=torch.float64, device=device)
+        elif self.num_classes != num_classes:
+            raise ValueError(
+                f'Number of classes changed during evaluation: '
+                f'{self.num_classes} -> {num_classes}'
+            )
+
+    def _prepare_target(
+        self,
+        label_map: torch.Tensor,
+        out_hw: tuple[int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if label_map.dim() == 4:
+            if label_map.shape[1] != 1:
+                raise ValueError(f'Expected label_map [B,H,W] or [B,1,H,W], got {tuple(label_map.shape)}')
+            label_map = label_map[:, 0]
+        elif label_map.dim() != 3:
+            raise ValueError(f'Expected label_map [B,H,W] or [B,1,H,W], got {tuple(label_map.shape)}')
+
+        label_map = label_map.long().to(device)
+        if tuple(label_map.shape[-2:]) != tuple(out_hw):
+            label_map = F.interpolate(
+                label_map[:, None].float(),
+                size=out_hw,
+                mode='nearest',
+            )[:, 0].long()
+        return label_map
 
     def update(self, outputs: TensorDict, targets: TensorDict):
-        logits = outputs['semantic_logits']
-        preds = logits.sigmoid() >= self.threshold
-        target = self._prepare_target(targets['semantic_masks'], logits.shape[-2:], logits.device) >= 0.5
-        self.intersection += float((preds & target).sum().item())
-        self.union += float((preds | target).sum().item())
-        self.correct += float((preds == target).sum().item())
-        self.total += float(target.numel())
-        self.pred_sum += float(preds.sum().item())
-        self.target_sum += float(target.sum().item())
+        if 'semantic_logits' not in outputs:
+            raise ValueError('semantic_logits is required in semantic outputs.')
+        if 'label_map' not in targets:
+            raise ValueError('label_map is required in semantic targets.')
+
+        logits = outputs['semantic_logits']            # [B, C, H, W]
+        pred = logits.argmax(dim=1)                   # [B, H, W]
+        target = self._prepare_target(
+            label_map=targets['label_map'],
+            out_hw=logits.shape[-2:],
+            device=logits.device,
+        )
+
+        num_classes = logits.shape[1]
+        self._ensure_buffers(num_classes=num_classes, device=logits.device)
+
+        valid = target != self.ignore_index
+        self.correct += float(((pred == target) & valid).sum().item())
+        self.total += float(valid.sum().item())
+
+        for cls_id in range(num_classes):
+            pred_c = (pred == cls_id) & valid
+            target_c = (target == cls_id) & valid
+
+            inter = (pred_c & target_c).sum()
+            union = (pred_c | target_c).sum()
+            tgt_count = target_c.sum()
+
+            self.intersection[cls_id] += inter.double()
+            self.union[cls_id] += union.double()
+            self.target_count[cls_id] += tgt_count.double()
 
     def compute(self) -> Dict[str, float]:
+        if self.num_classes is None:
+            return {}
+
+        per_class_iou = self.intersection / self.union.clamp(min=1.0)
+        per_class_acc = self.intersection / self.target_count.clamp(min=1.0)
+
+        valid_iou = self.union > 0
+        valid_acc = self.target_count > 0
+
+        miou = per_class_iou[valid_iou].mean().item() if valid_iou.any() else 0.0
+        macc = per_class_acc[valid_acc].mean().item() if valid_acc.any() else 0.0
         pixel_acc = self.correct / max(self.total, 1.0)
-        iou = self.intersection / max(self.union, 1.0)
-        dice = (2.0 * self.intersection) / max(self.pred_sum + self.target_sum, 1.0)
-        return {
-            'semantic.pixel_acc': pixel_acc,
-            'semantic.iou': iou,
-            'semantic.dice': dice,
+
+        out = {
+            'semantic.miou': float(miou),
+            'semantic.macc': float(macc),
+            'semantic.pixel_acc': float(pixel_acc),
         }
 
+        for i in range(self.num_classes):
+            out[f'semantic.iou_class_{i}'] = float(per_class_iou[i].item())
+            out[f'semantic.acc_class_{i}'] = float(per_class_acc[i].item())
 
-class QueryMaskInstanceEvaluator:
-    def __init__(self, score_threshold: float = 0.3, mask_threshold: float = 0.5, match_iou_threshold: float = 0.5):
-        self.score_threshold = float(score_threshold)
-        self.mask_threshold = float(mask_threshold)
-        self.match_iou_threshold = float(match_iou_threshold)
-        self.reset()
-
-    def reset(self):
-        self.tp = 0
-        self.fp = 0
-        self.fn = 0
-        self.sum_mask_iou = 0.0
-        self.sum_box_iou = 0.0
-        self.num_matches = 0
-
-    @staticmethod
-    def _take_last_if_stacked(x: torch.Tensor) -> torch.Tensor:
-        if x.dim() in (4, 5):
-            return x[-1]
-        return x
-
-    @staticmethod
-    def _to_mask_list(masks: torch.Tensor, num_boxes: Sequence[int]) -> List[torch.Tensor]:
-        if masks is None:
-            return [torch.zeros((0, 1, 1), dtype=torch.bool)] * len(num_boxes)
-        if masks.dim() == 4 and masks.shape[0] == len(num_boxes):
-            return [masks[b, :n] for b, n in enumerate(num_boxes)]
-        if masks.dim() == 3:
-            out = []
-            start = 0
-            for n in num_boxes:
-                out.append(masks[start:start + n])
-                start += n
-            return out
-        raise ValueError(f'Unsupported gt mask shape: {tuple(masks.shape)}')
-
-    @staticmethod
-    def _to_box_list(boxes: torch.Tensor, num_boxes: Sequence[int]) -> List[torch.Tensor]:
-        out = []
-        start = 0
-        for n in num_boxes:
-            out.append(boxes[start:start + n])
-            start += n
-        return out
-
-    @staticmethod
-    def _pairwise_mask_iou(pred_masks: torch.Tensor, tgt_masks: torch.Tensor) -> torch.Tensor:
-        pred = pred_masks.flatten(1).bool()
-        tgt = tgt_masks.flatten(1).bool()
-        inter = (pred[:, None] & tgt[None]).sum(dim=-1).float()
-        union = (pred[:, None] | tgt[None]).sum(dim=-1).float().clamp(min=1.0)
-        return inter / union
-
-    def update(self, outputs: TensorDict, targets: TensorDict):
-        pred_logits = self._take_last_if_stacked(outputs['pred_logits'])
-        pred_boxes = self._take_last_if_stacked(outputs['pred_boxes'])
-        pred_masks = self._take_last_if_stacked(outputs['pred_masks'])
-
-        scores = pred_logits.squeeze(-1).sigmoid()
-        num_boxes = targets['num_boxes']
-        if isinstance(num_boxes, torch.Tensor):
-            num_boxes = [int(x) for x in num_boxes.view(-1).tolist()]
-        else:
-            num_boxes = [int(num_boxes)]
-
-        gt_boxes_list = self._to_box_list(targets['boxes'], num_boxes)
-        gt_masks_list = self._to_mask_list(targets['masks'], num_boxes)
-
-        for b in range(pred_logits.shape[0]):
-            keep = scores[b] >= self.score_threshold
-            pred_scores_b = scores[b][keep]
-            pred_boxes_b = pred_boxes[b][keep]
-            pred_masks_b = pred_masks[b][keep]
-            if pred_scores_b.numel() == 0:
-                self.fn += int(gt_boxes_list[b].shape[0])
-                continue
-
-            order = torch.argsort(pred_scores_b, descending=True)
-            pred_boxes_b = pred_boxes_b[order]
-            pred_masks_b = pred_masks_b[order].sigmoid() >= self.mask_threshold
-            gt_boxes_b = gt_boxes_list[b]
-            gt_masks_b = gt_masks_list[b].bool()
-            if gt_masks_b.numel() == 0:
-                self.fp += int(pred_boxes_b.shape[0])
-                continue
-            if pred_masks_b.shape[-2:] != gt_masks_b.shape[-2:]:
-                pred_masks_b = F.interpolate(pred_masks_b[:, None].float(), size=gt_masks_b.shape[-2:], mode='nearest')[:, 0] > 0.5
-
-            mask_iou = self._pairwise_mask_iou(pred_masks_b, gt_masks_b)
-            box_iou = generalized_box_iou(box_cxcywh_to_xyxy(pred_boxes_b), box_cxcywh_to_xyxy(gt_boxes_b))
-
-            matched_gt = set()
-            tp = 0
-            fp = 0
-            for i in range(pred_boxes_b.shape[0]):
-                best_iou, best_j = mask_iou[i].max(dim=0)
-                j = int(best_j.item())
-                if float(best_iou.item()) >= self.match_iou_threshold and j not in matched_gt:
-                    matched_gt.add(j)
-                    tp += 1
-                    self.sum_mask_iou += float(best_iou.item())
-                    self.sum_box_iou += float(box_iou[i, j].item())
-                    self.num_matches += 1
-                else:
-                    fp += 1
-            fn = int(gt_boxes_b.shape[0]) - len(matched_gt)
-            self.tp += tp
-            self.fp += fp
-            self.fn += fn
-
-    def compute(self) -> Dict[str, float]:
-        precision = self.tp / max(self.tp + self.fp, 1)
-        recall = self.tp / max(self.tp + self.fn, 1)
-        f1 = (2 * precision * recall) / max(precision + recall, 1e-8)
-        mean_mask_iou = self.sum_mask_iou / max(self.num_matches, 1)
-        mean_box_iou = self.sum_box_iou / max(self.num_matches, 1)
-        return {
-            'instance.precision': precision,
-            'instance.recall': recall,
-            'instance.f1': f1,
-            'instance.mean_mask_iou': mean_mask_iou,
-            'instance.mean_box_iou': mean_box_iou,
-        }
-
-
-class HybridEvaluator:
-    def __init__(self, instance_evaluator: Optional[QueryMaskInstanceEvaluator] = None, semantic_evaluator: Optional[BinarySemanticEvaluator] = None):
-        self.instance_evaluator = instance_evaluator or QueryMaskInstanceEvaluator()
-        self.semantic_evaluator = semantic_evaluator or BinarySemanticEvaluator()
-
-    def reset(self):
-        self.instance_evaluator.reset()
-        self.semantic_evaluator.reset()
-
-    def update(self, outputs: Dict[str, Dict[str, torch.Tensor]], instance_targets: TensorDict, semantic_targets: TensorDict):
-        self.instance_evaluator.update(outputs['instance_outputs'], instance_targets)
-        self.semantic_evaluator.update(outputs['semantic_outputs'], semantic_targets)
-
-    def compute(self) -> Dict[str, float]:
-        out = {}
-        out.update(self.instance_evaluator.compute())
-        out.update(self.semantic_evaluator.compute())
         return out
 
 
@@ -233,7 +140,6 @@ class HybridEvaluator:
 def evaluate_model(
     model,
     dataloader,
-    task: str,
     device: torch.device | str = 'cuda',
     visualizer: Optional[VisualizationManager] = None,
     epoch: Optional[int] = None,
@@ -241,34 +147,15 @@ def evaluate_model(
 ) -> Dict[str, float]:
     device = torch.device(device)
     model.eval()
-    if task == 'instance':
-        evaluator = QueryMaskInstanceEvaluator()
-    elif task == 'semantic':
-        evaluator = BinarySemanticEvaluator()
-    elif task == 'hybrid':
-        evaluator = HybridEvaluator()
-    else:
-        raise ValueError(f'Unsupported task: {task}')
+
+    evaluator = MulticlassSemanticEvaluator()
 
     for batch in dataloader:
         batch = move_batch_to_device(batch, device)
-        if task == 'instance':
-            outputs = model(batch, mode='instance')
-            targets = TargetConverter.from_batch(batch, task='instance')
-            evaluator.update(outputs['instance_outputs'], targets)
-            if visualizer is not None:
-                visualizer.save_instance_batch(batch, outputs['instance_outputs'], targets, epoch=epoch, stage=stage)
-        elif task == 'semantic':
-            outputs = model(batch, mode='semantic')
-            targets = TargetConverter.from_batch(batch, task='semantic')
-            evaluator.update(outputs['semantic_outputs'], targets)
-            if visualizer is not None:
-                visualizer.save_semantic_batch(batch, outputs['semantic_outputs'], targets, epoch=epoch, stage=stage)
-        else:
-            outputs = model(batch, mode='hybrid')
-            instance_targets = TargetConverter.from_batch(batch, task='instance')
-            semantic_targets = TargetConverter.from_batch(batch, task='semantic')
-            evaluator.update(outputs, instance_targets, semantic_targets)
-            if visualizer is not None:
-                visualizer.save_semantic_batch(batch, outputs['semantic_outputs'], semantic_targets, epoch=epoch, stage=stage)
+        outputs = model(batch)
+        targets = {'label_map': batch.find_targets[0].semantic_label_map}
+        evaluator.update(outputs, targets)
+        if visualizer is not None:
+            visualizer.save_semantic_batch(batch, outputs, targets, epoch=epoch, stage=stage)
+
     return evaluator.compute()

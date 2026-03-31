@@ -18,15 +18,13 @@ model = dict(
     semantic_topk=20,
     semantic_aggregation='weighted_sum',
     freeze_cfg=dict(
-        freeze_backbone=True,
-        freeze_text_encoder=True,
-        freeze_transformer_encoder=True,
-        freeze_transformer_decoder=True,
-        freeze_geometry_encoder=True,
-        freeze_dot_prod_scoring=True,
-        freeze_segmentation_head=False,
-        train_adapters_only=False,
-        trainable_name_keywords=['semantic_adapter', 'segmentation_head'],
+        train_adapters_only=True,
+        trainable_modules=[
+            'semantic_adapter',
+            'instance_adapter',
+            'core.segmentation_head',
+            'core.dot_prod_scoring',
+        ],
     ),
 )
 
@@ -56,15 +54,14 @@ train_dataloader = dict(
         transforms=[
             dict(type='ToTensor'),
             dict(type='ConvertImageDtype'),
-            dict(type='ResizeLongestSide', long_side=1008, box_format='xyxy'),
+            dict(type='ResizeLongestSide', long_side=1008),
             dict(type='PadToSize', size=(1008, 1008)),
         ]
     ),
     collate_fn=dict(
-        type='data.collate.SAM3BatchCollator',
+        type='data.collate.OVSemanticCollator',
         pad_size_divisor=14,
-        normalize_boxes=True,
-        box_format='xyxy',
+        label_pad_value=255,
     ),
 )
 
@@ -94,31 +91,35 @@ val_dataloader = dict(
         transforms=[
             dict(type='ToTensor'),
             dict(type='ConvertImageDtype'),
-            dict(type='ResizeLongestSide', long_side=1008, box_format='xyxy'),
+            dict(type='ResizeLongestSide', long_side=1008),
             dict(type='PadToSize', size=(1008, 1008)),
         ]
     ),
     collate_fn=dict(
-        type='data.collate.SAM3BatchCollator',
+        type='data.collate.OVSemanticCollator',
         pad_size_divisor=14,
-        normalize_boxes=True,
-        box_format='xyxy',
+        label_pad_value=255,
     ),
 )
 
 train_cfg = dict(
-    task='semantic',
     max_epochs=12,
     log_interval=20,
     use_amp=True,
     grad_clip_norm=0.1,
     save_interval=1,
+    eval_interval=1,
+    monitor='total_loss',
+    monitor_mode='min',
+    max_keep_ckpts=5,
     device='cuda',
+    auto_resume=False,
 )
 
 criterion = dict(
     semantic=dict(
-        loss_bce=1.0,
-        loss_dice=1.0,
-    )
+        loss_ce=1.0,
+        loss_dice=0.0,
+    ),
+    ignore_index=255,
 )

@@ -43,17 +43,20 @@ def resolve_bpe_path(explicit_bpe_path=None):
 
     candidate_paths = [
         PROJECT_ROOT / 'assets' / 'bpe_simple_vocab_16e6.txt.gz',
+        PROJECT_ROOT / 'assets' / 'clip' / 'bpe_simple_vocab_16e6.txt.gz',
         PROJECT_ROOT / 'configs' / 'bpe_simple_vocab_16e6.txt.gz',
+        PROJECT_ROOT / 'configs' / 'clip' / 'bpe_simple_vocab_16e6.txt.gz',
     ]
 
     for p in candidate_paths:
         if p.exists():
             return str(p)
 
+    tried = '\n'.join(str(p) for p in candidate_paths)
     raise FileNotFoundError(
-        'Cannot find bpe_simple_vocab_16e6.txt.gz. '
-        'Please place it under assets/clip or configs/clip, '
-        'or pass bpe_path explicitly in config.'
+        'Cannot find bpe_simple_vocab_16e6.txt.gz. Tried:\n'
+        f'{tried}\n'
+        'Please pass `bpe_path` explicitly in config.'
     )
 
 
@@ -70,15 +73,9 @@ _setup_tf32()
 
 @dataclass
 class FreezeConfig:
-    freeze_backbone: bool = True
-    freeze_text_encoder: bool = True
-    freeze_transformer_encoder: bool = True
-    freeze_transformer_decoder: bool = True
-    freeze_geometry_encoder: bool = True
-    freeze_dot_prod_scoring: bool = True
-    freeze_segmentation_head: bool = False
     train_adapters_only: bool = False
-    trainable_name_keywords: list[str] = field(default_factory=list)
+    trainable_modules: list[str] = field(default_factory=list)
+    frozen_modules: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -88,9 +85,7 @@ class SegmentorBuildConfig:
     load_from_hf: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     eval_mode: bool = True
-    enable_segmentation: bool = True
     compile: bool = False
-    return_segmentor: bool = True
     semantic_topk: Optional[int] = 20
     semantic_aggregation: str = "weighted_sum"
     freeze_cfg: FreezeConfig = field(default_factory=FreezeConfig)
@@ -98,20 +93,46 @@ class SegmentorBuildConfig:
 
 class FrozenModuleMixin:
     @staticmethod
-    def freeze_module(module: Optional[nn.Module]) -> None:
+    def set_requires_grad(module: Optional[nn.Module], requires_grad: bool) -> None:
         if module is None:
             return
-        module.eval()
         for p in module.parameters():
-            p.requires_grad = False
+            p.requires_grad = requires_grad
+        module.train(requires_grad)
 
     @staticmethod
-    def unfreeze_by_keywords(model: nn.Module, keywords: list[str]) -> None:
-        if not keywords:
+    def set_model_requires_grad(model: nn.Module, requires_grad: bool) -> None:
+        for p in model.parameters():
+            p.requires_grad = requires_grad
+        model.train(requires_grad)
+
+    @staticmethod
+    def get_named_modules(model: nn.Module) -> dict[str, nn.Module]:
+        return dict(model.named_modules())
+
+    @classmethod
+    def set_modules_requires_grad(
+        cls,
+        model: nn.Module,
+        module_names: list[str],
+        requires_grad: bool,
+        strict: bool = True,
+    ) -> None:
+        if not module_names:
             return
-        for name, param in model.named_parameters():
-            if any(k in name for k in keywords):
-                param.requires_grad = True
+
+        named_modules = cls.get_named_modules(model)
+
+        for name in module_names:
+            if name not in named_modules:
+                if strict:
+                    available = '\n'.join(sorted(named_modules.keys()))
+                    raise KeyError(
+                        f'Unknown module name: {name}\n'
+                        f'Available module names are:\n{available}'
+                    )
+                continue
+            cls.set_requires_grad(named_modules[name], requires_grad)
 
 
 class SAM3ModelBuilder(FrozenModuleMixin):
@@ -378,36 +399,22 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def apply_freeze_cfg(cls, model: nn.Module, freeze_cfg: FreezeConfig) -> None:
-        if freeze_cfg.freeze_backbone and hasattr(model, "core"):
-            cls.freeze_module(model.core.backbone.vision_backbone)
-        if freeze_cfg.freeze_text_encoder and hasattr(model, "core"):
-            cls.freeze_module(model.core.backbone.language_backbone)
-        if freeze_cfg.freeze_transformer_encoder and hasattr(model, "core"):
-            cls.freeze_module(model.core.transformer.encoder)
-        if freeze_cfg.freeze_transformer_decoder and hasattr(model, "core"):
-            cls.freeze_module(model.core.transformer.decoder)
-        if freeze_cfg.freeze_geometry_encoder and hasattr(model, "core"):
-            cls.freeze_module(model.core.geometry_encoder)
-        if freeze_cfg.freeze_dot_prod_scoring and hasattr(model, "core"):
-            cls.freeze_module(model.core.dot_prod_scoring)
-        if freeze_cfg.freeze_segmentation_head and hasattr(model, "core"):
-            cls.freeze_module(model.core.segmentation_head)
-
         if freeze_cfg.train_adapters_only:
-            for p in model.parameters():
-                p.requires_grad = False
-            cls.unfreeze_by_keywords(
+            cls.set_model_requires_grad(model, False)
+            cls.set_modules_requires_grad(
                 model,
-                freeze_cfg.trainable_name_keywords or [
-                    "semantic_adapter",
-                    "instance_adapter",
-                    "adapter",
-                    "lora",
-                    "proj",
-                ],
+                freeze_cfg.trainable_modules,
+                True,
+                strict=True,
             )
         else:
-            cls.unfreeze_by_keywords(model, freeze_cfg.trainable_name_keywords)
+            cls.set_model_requires_grad(model, True)
+            cls.set_modules_requires_grad(
+                model,
+                freeze_cfg.frozen_modules,
+                False,
+                strict=True,
+            )
 
     @classmethod
     def build_sam3_image_model(cls, cfg: SegmentorBuildConfig) -> nn.Module:
@@ -423,7 +430,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         backbone = cls._create_vl_backbone(vit_neck, text_encoder)
         transformer = cls._create_sam3_transformer()
         dot_prod_scoring = cls._create_dot_product_scoring()
-        segmentation_head = cls._create_segmentation_head(compile_mode=compile_mode) if cfg.enable_segmentation else None
+        segmentation_head = cls._create_segmentation_head(compile_mode=compile_mode)
         input_geometry_encoder = cls._create_geometry_encoder()
 
         model = cls._create_sam3_model(
@@ -445,14 +452,11 @@ class SAM3ModelBuilder(FrozenModuleMixin):
     @classmethod
     def build_segmentor(cls, cfg: SegmentorBuildConfig) -> nn.Module:
         sam3_image_model = cls.build_sam3_image_model(cfg)
-        if cfg.return_segmentor:
-            model = build_segmentor_from_sam3_image(
-                sam3_image_model,
-                semantic_topk=cfg.semantic_topk,
-                semantic_aggregation=cfg.semantic_aggregation,
-            )
-        else:
-            model = sam3_image_model
+        model = build_segmentor_from_sam3_image(
+            sam3_image_model,
+            semantic_topk=cfg.semantic_topk,
+            semantic_aggregation=cfg.semantic_aggregation,
+        )
 
         model = model.to(cfg.device)
         if cfg.eval_mode:
@@ -460,8 +464,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         else:
             model.train()
 
-        if cfg.return_segmentor:
-            cls.apply_freeze_cfg(model, cfg.freeze_cfg)
+        cls.apply_freeze_cfg(model, cfg.freeze_cfg)
         return model
 
 

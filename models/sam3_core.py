@@ -102,11 +102,3 @@ class Sam3Core(Sam3Image):
             find_input=find_input,
             geometric_prompt=geometric_prompt,
         )
-
-    def forward_instance(self, input: BatchedDatapoint) -> Dict[str, torch.Tensor]:
-        """Alias kept for trainer readability."""
-        return self.forward(input)
-
-    def forward_semantic(self, input: BatchedDatapoint) -> Dict[str, torch.Tensor]:
-        """Same raw forward; semantic-specific aggregation happens in adapter."""
-        return self.forward(input)

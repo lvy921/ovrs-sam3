@@ -8,7 +8,6 @@ optim_wrapper = dict(
             norm_decay_mult=0.0,
             custom_keys={
                 'semantic_adapter': dict(lr_mult=1.0, decay_mult=1.0),
-                'instance_adapter': dict(lr_mult=1.0, decay_mult=1.0),
                 'segmentation_head': dict(lr_mult=1.0, decay_mult=1.0),
                 'prompt_mlp': dict(lr_mult=0.5, decay_mult=1.0),
             },

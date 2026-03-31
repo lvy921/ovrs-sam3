@@ -1,9 +1,13 @@
-# Replace `your_project` with your actual package name.
-# This template now ships with:
-# - data/dataset.py  -> JsonPromptSegDataset
-# - data/collate.py  -> SAM3BatchCollator
-#
-# Example annotation schema is documented in JsonPromptSegDataset.
+# 这里只是示例，你可以把 classes 单独放到别的 config 里再 import
+
+ld50k_classes = [
+    # 在这里填你的 40 个类别名
+    # 例如：
+    # 'water',
+    # 'building',
+    # 'road',
+    # ...
+]
 
 train_dataloader = dict(
     batch_size=2,
@@ -12,19 +16,23 @@ train_dataloader = dict(
     pin_memory=True,
     persistent_workers=True,
     dataset=dict(
-        type='data.dataset.JsonPromptSegDataset',
-        data_root='data/train',
+        type='data.dataset.OVSemanticSegDataset',
+        img_dir='data/ld50k/img_dir/train',
+        ann_dir='data/ld50k/ann_dir/train',
+        classes=ld50k_classes,
+        ignore_index=255,
+        reduce_zero_label=True,
+        return_raw_image=True,
         transforms=[
             dict(type='ToTensor'),
             dict(type='ConvertImageDtype'),
-            dict(type='ResizeLongestSide', long_side=1008, box_format='xyxy'),
+            dict(type='ResizeLongestSide', long_side=1008),
         ],
     ),
     collate_fn=dict(
-        type='data.collate.SAM3BatchCollator',
+        type='data.collate.OVSemanticCollator',
         pad_size_divisor=14,
-        normalize_boxes=True,
-        box_format='xyxy',
+        label_pad_value=255,
     ),
 )
 
@@ -35,18 +43,22 @@ val_dataloader = dict(
     pin_memory=True,
     persistent_workers=True,
     dataset=dict(
-        type='data.dataset.JsonPromptSegDataset',
-        data_root='data/val',
+        type='data.dataset.OVSemanticSegDataset',
+        img_dir='data/ld50k/img_dir/val',
+        ann_dir='data/ld50k/ann_dir/val',
+        classes=ld50k_classes,
+        ignore_index=255,
+        reduce_zero_label=True,
+        return_raw_image=True,
         transforms=[
             dict(type='ToTensor'),
             dict(type='ConvertImageDtype'),
-            dict(type='ResizeLongestSide', long_side=1008, box_format='xyxy'),
+            dict(type='ResizeLongestSide', long_side=1008),
         ],
     ),
     collate_fn=dict(
-        type='data.collate.SAM3BatchCollator',
+        type='data.collate.OVSemanticCollator',
         pad_size_divisor=14,
-        normalize_boxes=True,
-        box_format='xyxy',
+        label_pad_value=255,
     ),
 )

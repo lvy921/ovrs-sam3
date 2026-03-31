@@ -11,9 +11,14 @@ import torch
 
 if __package__ in (None, ''):
     repo_root = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(repo_root.parent))
-    package_name = repo_root.name
     from importlib import import_module
+    import types
+
+    package_name = "_ovrs_sam3_localpkg"
+    if package_name not in sys.modules:
+        pkg = types.ModuleType(package_name)
+        pkg.__path__ = [str(repo_root)]
+        sys.modules[package_name] = pkg
 
     build_dataloader = import_module(f'{package_name}.data.build').build_dataloader
     Config = import_module(f'{package_name}.engine.config').Config
@@ -25,16 +30,9 @@ if __package__ in (None, ''):
     TrainerConfig = _trainer_mod.TrainerConfig
     _hooks_mod = import_module(f'{package_name}.engine.hooks')
     LoggerHook = _hooks_mod.LoggerHook
-    EvalHook = _hooks_mod.EvalHook
     CheckpointHook = _hooks_mod.CheckpointHook
     _vis_mod = import_module(f'{package_name}.engine.visualization')
     VisualizationManager = _vis_mod.VisualizationManager
-    _hybrid_mod = import_module(f'{package_name}.losses.hybrid_criterion')
-    HybridCriterion = _hybrid_mod.HybridCriterion
-    HybridLossWeights = _hybrid_mod.HybridLossWeights
-    _inst_mod = import_module(f'{package_name}.losses.instance_criterion')
-    InstanceCriterion = _inst_mod.InstanceCriterion
-    InstanceLossWeights = _inst_mod.InstanceLossWeights
     _sem_mod = import_module(f'{package_name}.losses.semantic_criterion')
     SemanticCriterion = _sem_mod.SemanticCriterion
     SemanticLossWeights = _sem_mod.SemanticLossWeights
@@ -44,12 +42,10 @@ if __package__ in (None, ''):
 else:
     from ..data.build import build_dataloader
     from ..engine.config import Config
-    from ..engine.hooks import CheckpointHook, EvalHook, LoggerHook
+    from ..engine.hooks import CheckpointHook, LoggerHook
     from ..engine.optimizer_builder import build_optimizer, build_scheduler
     from ..engine.trainer import Trainer, TrainerConfig
     from ..engine.visualization import VisualizationManager
-    from ..losses.hybrid_criterion import HybridCriterion, HybridLossWeights
-    from ..losses.instance_criterion import InstanceCriterion, InstanceLossWeights
     from ..losses.semantic_criterion import SemanticCriterion, SemanticLossWeights
     from ..model_builder import FreezeConfig, build_segmentor_model
 
@@ -76,20 +72,10 @@ def _to_dotdict(obj: Any):
 
 
 def build_criterion(cfg: Dict[str, Any]):
-    task = cfg['train_cfg']['task']
     criterion_cfg = cfg.get('criterion', {})
-    if task == 'instance':
-        weights = InstanceLossWeights(**criterion_cfg.get('instance', {}))
-        return InstanceCriterion(weights=weights)
-    if task == 'semantic':
-        weights = SemanticLossWeights(**criterion_cfg.get('semantic', {}))
-        return SemanticCriterion(weights=weights)
-    if task == 'hybrid':
-        inst = InstanceCriterion(weights=InstanceLossWeights(**criterion_cfg.get('instance', {})))
-        sem = SemanticCriterion(weights=SemanticLossWeights(**criterion_cfg.get('semantic', {})))
-        hybrid_weights = HybridLossWeights(**criterion_cfg.get('hybrid', {}))
-        return HybridCriterion(inst, sem, hybrid_weights)
-    raise ValueError(f'Unsupported task: {task}')
+    weights = SemanticLossWeights(**criterion_cfg.get('semantic', {}))
+    ignore_index = int(criterion_cfg.get('ignore_index', 255))
+    return SemanticCriterion(weights=weights, ignore_index=ignore_index)
 
 
 def build_hooks(cfg) -> List[object]:
@@ -97,9 +83,6 @@ def build_hooks(cfg) -> List[object]:
     default_hooks = cfg.get('default_hooks', {}) or {}
     logger_cfg = default_hooks.get('logger') or {'interval': int(cfg.train_cfg.get('log_interval', 20))}
     hooks.append(LoggerHook(interval=int(logger_cfg.get('interval', cfg.train_cfg.get('log_interval', 20)))))
-
-    if cfg.get('val_dataloader') is not None:
-        hooks.append(EvalHook())
 
     ckpt_cfg = default_hooks.get('checkpoint') or {}
     hooks.append(
@@ -114,7 +97,7 @@ def build_hooks(cfg) -> List[object]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train/Eval SAM3 segmentor with simple mmseg-style config.')
+    parser = argparse.ArgumentParser(description='Train/Eval SAM3 semantic-only segmentor with simple mmseg-style config.')
     parser.add_argument('config', type=str, help='path to config file')
     parser.add_argument('--work-dir', type=str, default=None)
     parser.add_argument('--resume-from', type=str, default=None)
@@ -141,7 +124,6 @@ def main():
     criterion = build_criterion(cfg)
 
     trainer_cfg = TrainerConfig(
-        task=cfg.train_cfg.task,
         max_epochs=int(cfg.train_cfg.max_epochs),
         log_interval=int(cfg.train_cfg.get('log_interval', 20)),
         use_amp=bool(cfg.train_cfg.get('use_amp', True)),

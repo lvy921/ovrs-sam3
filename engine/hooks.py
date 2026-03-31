@@ -66,16 +66,6 @@ class LoggerHook(Hook):
 
 
 @dataclass
-class EvalHook(Hook):
-    priority: int = 60
-
-    def after_val_epoch(self, trainer, epoch: int, val_stats: Dict[str, float]):
-        # Placeholder hook for future custom evaluator integration.
-        # Keeping it as a dedicated object now makes the engine easier to extend later.
-        return None
-
-
-@dataclass
 class CheckpointHook(Hook):
     interval: int = 1
     save_best: bool = True

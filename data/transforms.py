@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, MutableMapping, Sequence, Tuple
 
 import numpy as np
@@ -52,54 +51,14 @@ def _resize_tensor_image(image: torch.Tensor, size: Tuple[int, int]) -> torch.Te
     raise ValueError(f'Unsupported image shape: {tuple(image.shape)}')
 
 
-def _resize_mask(mask: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
-    if mask is None:
+def _resize_label_map(label_map: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
+    if label_map is None:
         return None
-    if mask.ndim == 2:
-        mask = mask[None, None].float()
-        return F.interpolate(mask, size=size, mode='nearest')[0, 0]
-    if mask.ndim == 3:
-        mask = mask[:, None].float()
-        return F.interpolate(mask, size=size, mode='nearest')[:, 0]
-    if mask.ndim == 4:
-        return F.interpolate(mask.float(), size=size, mode='nearest')
-    raise ValueError(f'Unsupported mask shape: {tuple(mask.shape)}')
-
-
-def _flip_boxes_horizontally(boxes: torch.Tensor, image_width: int, box_format: str) -> torch.Tensor:
-    if boxes is None:
-        return None
-    boxes = boxes.clone()
-    if box_format == 'xyxy':
-        x1 = boxes[..., 0].clone()
-        x2 = boxes[..., 2].clone()
-        boxes[..., 0] = image_width - x2
-        boxes[..., 2] = image_width - x1
-        return boxes
-    if box_format == 'cxcywh':
-        boxes[..., 0] = image_width - boxes[..., 0]
-        return boxes
-    raise ValueError(f'Unsupported box_format: {box_format}')
-
-
-def _scale_boxes(boxes: torch.Tensor, scale_x: float, scale_y: float, box_format: str) -> torch.Tensor:
-    if boxes is None:
-        return None
-    boxes = boxes.clone().float()
-    if box_format == 'xyxy':
-        boxes[..., 0] *= scale_x
-        boxes[..., 2] *= scale_x
-        boxes[..., 1] *= scale_y
-        boxes[..., 3] *= scale_y
-        return boxes
-    if box_format == 'cxcywh':
-        boxes[..., 0] *= scale_x
-        boxes[..., 2] *= scale_x
-        boxes[..., 1] *= scale_y
-        boxes[..., 3] *= scale_y
-        return boxes
-    raise ValueError(f'Unsupported box_format: {box_format}')
-
+    if label_map.ndim != 2:
+        raise ValueError(f'Unsupported label_map shape: {tuple(label_map.shape)}')
+    label_map = label_map[None, None].float()
+    label_map = F.interpolate(label_map, size=size, mode='nearest')[0, 0]
+    return label_map.long()
 
 class Compose:
     def __init__(self, transforms: Sequence):
@@ -124,12 +83,8 @@ class ToTensor:
     def __call__(self, sample: Sample) -> Sample:
         sample = dict(sample)
         sample['image'] = _to_tensor_image(sample['image'])
-        if 'semantic_mask' in sample:
-            sample['semantic_mask'] = _to_tensor_mask(sample.get('semantic_mask'))
-        if 'instance_masks' in sample:
-            sample['instance_masks'] = _to_tensor_mask(sample.get('instance_masks'))
-        if 'boxes' in sample and sample['boxes'] is not None and not isinstance(sample['boxes'], torch.Tensor):
-            sample['boxes'] = torch.as_tensor(sample['boxes'])
+        if 'label_map' in sample:
+            sample['label_map'] = _to_tensor_mask(sample.get('label_map')).long()
         return sample
 
 
@@ -163,32 +118,28 @@ class Normalize:
 
 
 class Resize:
-    def __init__(self, size: Tuple[int, int], box_format: str = 'xyxy'):
+    def __init__(self, size: Tuple[int, int]):
         self.size = tuple(size)
-        self.box_format = box_format
 
     def __call__(self, sample: Sample) -> Sample:
         sample = dict(sample)
         image = sample['image']
         h, w = image.shape[-2:]
         out_h, out_w = self.size
+
         sample['image'] = _resize_tensor_image(image, (out_h, out_w))
 
-        if 'semantic_mask' in sample and sample['semantic_mask'] is not None:
-            sample['semantic_mask'] = _resize_mask(sample['semantic_mask'], (out_h, out_w))
-        if 'instance_masks' in sample and sample['instance_masks'] is not None:
-            sample['instance_masks'] = _resize_mask(sample['instance_masks'], (out_h, out_w))
-        if 'boxes' in sample and sample['boxes'] is not None:
-            sample['boxes'] = _scale_boxes(sample['boxes'], out_w / w, out_h / h, self.box_format)
+        if 'label_map' in sample and sample['label_map'] is not None:
+            sample['label_map'] = _resize_label_map(sample['label_map'], (out_h, out_w))
+
         sample['img_shape'] = (out_h, out_w)
         sample['scale_factor'] = (out_w / w, out_h / h)
         return sample
 
 
 class ResizeLongestSide:
-    def __init__(self, long_side: int, box_format: str = 'xyxy'):
+    def __init__(self, long_side: int):
         self.long_side = int(long_side)
-        self.box_format = box_format
 
     def __call__(self, sample: Sample) -> Sample:
         image = sample['image']
@@ -196,46 +147,38 @@ class ResizeLongestSide:
         scale = self.long_side / max(h, w)
         out_h = max(1, int(round(h * scale)))
         out_w = max(1, int(round(w * scale)))
-        return Resize((out_h, out_w), box_format=self.box_format)(sample)
-
+        return Resize((out_h, out_w))(sample)
 
 class RandomResize:
-    def __init__(self, scales: Sequence[Tuple[int, int]], box_format: str = 'xyxy'):
+    def __init__(self, scales: Sequence[Tuple[int, int]]):
         self.scales = list(scales)
-        self.box_format = box_format
 
     def __call__(self, sample: Sample) -> Sample:
         size = random.choice(self.scales)
-        return Resize(size, box_format=self.box_format)(sample)
+        return Resize(size)(sample)
 
 
 class RandomHorizontalFlip:
-    def __init__(self, prob: float = 0.5, box_format: str = 'xyxy'):
+    def __init__(self, prob: float = 0.5):
         self.prob = float(prob)
-        self.box_format = box_format
 
     def __call__(self, sample: Sample) -> Sample:
         if random.random() >= self.prob:
             return sample
         sample = dict(sample)
-        image = sample['image']
-        image_width = int(image.shape[-1])
-        sample['image'] = torch.flip(image, dims=[-1])
+        sample['image'] = torch.flip(sample['image'], dims=[-1])
 
-        if 'semantic_mask' in sample and sample['semantic_mask'] is not None:
-            sample['semantic_mask'] = torch.flip(sample['semantic_mask'], dims=[-1])
-        if 'instance_masks' in sample and sample['instance_masks'] is not None:
-            sample['instance_masks'] = torch.flip(sample['instance_masks'], dims=[-1])
-        if 'boxes' in sample and sample['boxes'] is not None:
-            sample['boxes'] = _flip_boxes_horizontally(sample['boxes'], image_width, self.box_format)
+        if 'label_map' in sample and sample['label_map'] is not None:
+            sample['label_map'] = torch.flip(sample['label_map'], dims=[-1])
+
         return sample
 
 
 class PadToSize:
-    def __init__(self, size: Tuple[int, int], image_pad_value: float = 0.0, mask_pad_value: int = 0):
+    def __init__(self, size: Tuple[int, int], image_pad_value: float = 0.0, label_pad_value: int = 255):
         self.size = tuple(size)
         self.image_pad_value = float(image_pad_value)
-        self.mask_pad_value = int(mask_pad_value)
+        self.label_pad_value = int(label_pad_value)
 
     def _pad_last_two_dims(self, x: torch.Tensor, pad_value: float) -> torch.Tensor:
         out_h, out_w = self.size
@@ -249,35 +192,10 @@ class PadToSize:
     def __call__(self, sample: Sample) -> Sample:
         sample = dict(sample)
         sample['image'] = self._pad_last_two_dims(sample['image'], self.image_pad_value)
-        if 'semantic_mask' in sample and sample['semantic_mask'] is not None:
-            sample['semantic_mask'] = self._pad_last_two_dims(sample['semantic_mask'], self.mask_pad_value)
-        if 'instance_masks' in sample and sample['instance_masks'] is not None:
-            sample['instance_masks'] = self._pad_last_two_dims(sample['instance_masks'], self.mask_pad_value)
+
+        if 'label_map' in sample and sample['label_map'] is not None:
+            sample['label_map'] = self._pad_last_two_dims(sample['label_map'], self.label_pad_value).long()
+
         sample['pad_shape'] = self.size
         return sample
 
-
-class ClampBoxes:
-    def __init__(self, image_key: str = 'image', box_format: str = 'xyxy'):
-        self.image_key = image_key
-        self.box_format = box_format
-
-    def __call__(self, sample: Sample) -> Sample:
-        sample = dict(sample)
-        boxes = sample.get('boxes')
-        if boxes is None:
-            return sample
-        h, w = sample[self.image_key].shape[-2:]
-        boxes = boxes.clone()
-        if self.box_format == 'xyxy':
-            boxes[..., 0::2] = boxes[..., 0::2].clamp(0, w)
-            boxes[..., 1::2] = boxes[..., 1::2].clamp(0, h)
-        elif self.box_format == 'cxcywh':
-            boxes[..., 0] = boxes[..., 0].clamp(0, w)
-            boxes[..., 1] = boxes[..., 1].clamp(0, h)
-            boxes[..., 2] = boxes[..., 2].clamp(min=0)
-            boxes[..., 3] = boxes[..., 3].clamp(min=0)
-        else:
-            raise ValueError(f'Unsupported box_format: {self.box_format}')
-        sample['boxes'] = boxes
-        return sample

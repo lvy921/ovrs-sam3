@@ -1,5 +1,5 @@
 seed = 42
-work_dir = './work_dirs/sam3_debug'
+work_dir = './work_dirs/sam3_semantic'
 
 default_scope = 'sam3'
 

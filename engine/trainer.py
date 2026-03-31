@@ -18,7 +18,6 @@ from .visualization import VisualizationManager
 
 @dataclass
 class TrainerConfig:
-    task: str = 'instance'  # instance | semantic | hybrid
     max_epochs: int = 12
     log_interval: int = 20
     use_amp: bool = True
@@ -118,21 +117,9 @@ class Trainer:
         return obj
 
     def _compute_losses(self, batch) -> Dict[str, torch.Tensor]:
-        task = self.cfg.task
-        if task == 'instance':
-            outputs = self.model(batch, mode='instance')
-            targets = TargetConverter.from_batch(batch, task='instance')
-            return self.criterion(outputs['instance_outputs'], targets)
-        if task == 'semantic':
-            outputs = self.model(batch, mode='semantic')
-            targets = TargetConverter.from_batch(batch, task='semantic')
-            return self.criterion(outputs['semantic_outputs'], targets)
-        if task == 'hybrid':
-            outputs = self.model(batch, mode='hybrid')
-            instance_targets = TargetConverter.from_batch(batch, task='instance')
-            semantic_targets = TargetConverter.from_batch(batch, task='semantic')
-            return self.criterion(outputs, instance_targets, semantic_targets)
-        raise ValueError(f'Unsupported task: {task}')
+        outputs = self.model(batch)
+        targets = {'label_map': batch.find_targets[0].semantic_label_map}
+        return self.criterion(outputs, targets)
 
     def train_step(self, batch) -> Dict[str, float]:
         self.model.train()
@@ -176,19 +163,11 @@ class Trainer:
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.hook_manager.call('before_train_epoch', self, epoch)
         epoch_stats: list[Dict[str, float]] = []
-        tic = time.time()
         for it, batch in enumerate(self.train_dataloader, start=1):
             self.hook_manager.call('before_train_iter', self, epoch, it, batch)
             stats = self.train_step(batch)
             epoch_stats.append(stats)
             self.hook_manager.call('after_train_iter', self, epoch, it, batch, stats)
-            if it % self.cfg.log_interval == 0:
-                elapsed = time.time() - tic
-                msg = f'epoch={epoch} iter={it} time={elapsed:.1f}s'
-                if 'total_loss' in stats:
-                    msg += f" total_loss={stats['total_loss']:.4f}"
-                print(msg)
-                tic = time.time()
 
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -204,16 +183,12 @@ class Trainer:
         metric_stats = evaluate_model(
             self.model,
             self.val_dataloader,
-            task=self.cfg.task,
             device=self.device,
             visualizer=self.visualizer,
             epoch=epoch,
             stage='val',
         )
         stats = {**loss_stats, **metric_stats}
-        if stats:
-            printable = ', '.join(f'{k}={v:.4f}' for k, v in stats.items())
-            print(f'val epoch={epoch}: {printable}')
         self.hook_manager.call('after_val_epoch', self, epoch, stats)
         return stats
 
