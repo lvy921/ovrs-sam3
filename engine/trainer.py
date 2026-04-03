@@ -29,6 +29,7 @@ class TrainerConfig:
     max_keep_ckpts: int = 5
     device: str = 'cuda'
     auto_resume: bool = False
+    tta_cfg: Optional[Dict] = None
 
 
 class Trainer:
@@ -186,6 +187,7 @@ class Trainer:
             visualizer=self.visualizer,
             epoch=epoch,
             stage='val',
+            tta_cfg=self.cfg.tta_cfg,
         )
         stats = {**loss_stats, **metric_stats}
         self.hook_manager.call('after_val_epoch', self, epoch, stats)

@@ -136,6 +136,7 @@ def main():
         max_keep_ckpts=int(cfg.train_cfg.get('max_keep_ckpts', 5)),
         device=str(cfg.train_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')),
         auto_resume=bool(args.auto_resume or cfg.train_cfg.get('auto_resume', False)),
+        tta_cfg=cfg.get('tta_cfg', None),
     )
 
     if args.eval_only:

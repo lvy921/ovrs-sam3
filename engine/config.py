@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 import runpy
+import types
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict
 
 
 class Config(dict):
@@ -30,8 +31,11 @@ class Config(dict):
 
         current_cfg = {
             k: v for k, v in namespace.items()
-            if not k.startswith('__') and k not in ('_base_',)
+            if not k.startswith('__')
+            and k not in ('_base_',)
+            and not isinstance(v, types.ModuleType)
         }
+
         merged = cls._merge_dicts(merged, current_cfg)
         return merged
 

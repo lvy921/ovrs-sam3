@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import math
 from dataclasses import fields, is_dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -133,6 +135,111 @@ class MulticlassSemanticEvaluator:
 
         return out
 
+def _round_up(value: int, divisor: int) -> int:
+    return int(math.ceil(value / divisor) * divisor)
+
+
+def _flip_image_batch(img_batch: torch.Tensor, flip_mode: str) -> torch.Tensor:
+    if flip_mode == 'none':
+        return img_batch
+    if flip_mode == 'h':
+        return torch.flip(img_batch, dims=[-1])
+    if flip_mode == 'v':
+        return torch.flip(img_batch, dims=[-2])
+    if flip_mode == 'hv':
+        return torch.flip(img_batch, dims=[-2, -1])
+    raise ValueError(f'Unknown flip_mode: {flip_mode}')
+
+
+def _deaugment_logits(logits: torch.Tensor, target_hw: tuple[int, int], flip_mode: str) -> torch.Tensor:
+    if flip_mode == 'h':
+        logits = torch.flip(logits, dims=[-1])
+    elif flip_mode == 'v':
+        logits = torch.flip(logits, dims=[-2])
+    elif flip_mode == 'hv':
+        logits = torch.flip(logits, dims=[-2, -1])
+    elif flip_mode != 'none':
+        raise ValueError(f'Unknown flip_mode: {flip_mode}')
+
+    if tuple(logits.shape[-2:]) != tuple(target_hw):
+        logits = F.interpolate(logits, size=target_hw, mode='bilinear', align_corners=False)
+    return logits
+
+
+@torch.no_grad()
+def inference_with_tta(
+    model,
+    batch,
+    tta_cfg: Optional[Dict],
+):
+    if tta_cfg is None or not bool(tta_cfg.get('enabled', False)):
+        return model(batch)
+
+    scales = [float(x) for x in tta_cfg.get('scales', [1.0])]
+    flip_modes = list(tta_cfg.get('flip_modes', ['none']))
+    size_divisor = int(tta_cfg.get('size_divisor', 14))
+
+    base_img_batch = batch.img_batch
+    target_hw = tuple(base_img_batch.shape[-2:])
+
+    sum_4d: Dict[str, torch.Tensor] = {}
+    sum_2d: Dict[str, torch.Tensor] = {}
+    num_views = 0
+    last_outputs = None
+
+    for scale in scales:
+        if scale <= 0:
+            raise ValueError(f'Invalid TTA scale: {scale}')
+
+        scaled_h = max(1, int(round(target_hw[0] * scale)))
+        scaled_w = max(1, int(round(target_hw[1] * scale)))
+        if size_divisor > 1:
+            scaled_h = _round_up(scaled_h, size_divisor)
+            scaled_w = _round_up(scaled_w, size_divisor)
+
+        resized_img_batch = F.interpolate(
+            base_img_batch,
+            size=(scaled_h, scaled_w),
+            mode='bilinear',
+            align_corners=False,
+        )
+
+        for flip_mode in flip_modes:
+            aug_batch = copy.deepcopy(batch)
+            aug_batch.img_batch = _flip_image_batch(resized_img_batch, flip_mode)
+
+            outputs = model(aug_batch)
+            last_outputs = outputs
+
+            for key, value in outputs.items():
+                if not torch.is_tensor(value):
+                    continue
+
+                if value.dim() == 4:
+                    deaug = _deaugment_logits(value, target_hw=target_hw, flip_mode=flip_mode)
+                    if key not in sum_4d:
+                        sum_4d[key] = deaug
+                    else:
+                        sum_4d[key] = sum_4d[key] + deaug
+
+                elif value.dim() == 2:
+                    if key not in sum_2d:
+                        sum_2d[key] = value
+                    else:
+                        sum_2d[key] = sum_2d[key] + value
+
+            num_views += 1
+
+    if last_outputs is None or num_views == 0:
+        raise RuntimeError('TTA produced no outputs.')
+
+    merged_outputs = dict(last_outputs)
+    for key, value in sum_4d.items():
+        merged_outputs[key] = value / float(num_views)
+    for key, value in sum_2d.items():
+        merged_outputs[key] = value / float(num_views)
+
+    return merged_outputs
 
 @torch.no_grad()
 def evaluate_model(
@@ -142,6 +249,7 @@ def evaluate_model(
     visualizer: Optional[VisualizationManager] = None,
     epoch: Optional[int] = None,
     stage: str = 'val',
+    tta_cfg: Optional[Dict] = None,
 ) -> Dict[str, float]:
     device = torch.device(device)
     model.eval()
@@ -150,9 +258,12 @@ def evaluate_model(
 
     for batch in dataloader:
         batch = move_batch_to_device(batch, device)
-        outputs = model(batch)
+
+        outputs = inference_with_tta(model, batch, tta_cfg=tta_cfg)
+
         targets = {'label_map': batch.find_targets[0].semantic_label_map}
         evaluator.update(outputs, targets)
+
         if visualizer is not None:
             visualizer.save_semantic_batch(batch, outputs, targets, epoch=epoch, stage=stage)
 

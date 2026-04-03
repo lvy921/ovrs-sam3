@@ -3,7 +3,7 @@ _base_ = [
     './_base_/optimizer.py',
     './_base_/schedule.py',
     './_base_/visualization.py',
-    './datasets/loveda.py'
+    './datasets/isaid.py'
 ]
 
 model = dict(
@@ -45,6 +45,13 @@ train_cfg = dict(
     max_keep_ckpts=5,
     device='cuda',
     auto_resume=False,
+)
+
+tta_cfg = dict(
+    enabled=False,
+    scales=[0.75, 1.0, 1.25],
+    flip_modes=['none', 'h', 'v'],
+    size_divisor=14,
 )
 
 criterion = dict(
