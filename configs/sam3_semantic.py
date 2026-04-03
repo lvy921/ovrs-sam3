@@ -3,13 +3,7 @@ _base_ = [
     './_base_/optimizer.py',
     './_base_/schedule.py',
     './_base_/visualization.py',
-]
-
-ld50k_classes = [
-    'background',
-    'agriculture land',
-    'vehicle',
-    'tree',
+    './datasets/loveda.py'
 ]
 
 model = dict(
@@ -21,74 +15,10 @@ model = dict(
     compile=False,
     semantic_topk=20,
     semantic_aggregation='weighted_sum',
-    prompt_chunk_size=16,   # 第5点会配套加代码
+    prompt_chunk_size=16,
     freeze_cfg=dict(
         train_adapters_only=True,
-        trainable_modules=[
-            'semantic_adapter',
-            'core.segmentation_head',
-            'core.dot_prod_scoring',
-        ],
-    ),
-)
-
-train_dataloader = dict(
-    batch_size=2,
-    num_workers=4,
-    shuffle=True,
-    pin_memory=True,
-    persistent_workers=True,
-    dataset=dict(
-        type='data.dataset.OVSemanticSegDataset',
-        img_dir='data/datasets/ld50k/img_dir/train',
-        ann_dir='data/datasets/ld50k/ann_dir/train',
-        classes=ld50k_classes,
-        img_suffix='.png',
-        seg_suffix='.png',
-        ignore_index=255,
-        reduce_zero_label=False,   # 第4点：显式保留 background
-        return_raw_image=True,
-        transforms=[
-            dict(type='ToTensor'),
-            dict(type='ConvertImageDtype'),
-            dict(type='ResizeLongestSide', long_side=1008),
-            dict(type='PadToSize', size=(1008, 1008), label_pad_value=255),
-        ],
-    ),
-    collate_fn=dict(
-        type='data.collate.OVSemanticCollator',
-        pad_size_divisor=14,
-        label_pad_value=255,
-    ),
-)
-
-val_dataloader = dict(
-    batch_size=1,
-    num_workers=2,
-    shuffle=False,
-    pin_memory=True,
-    persistent_workers=True,
-    dataset=dict(
-        type='data.dataset.OVSemanticSegDataset',
-        img_dir='data/datasets/ld50k/img_dir/val',
-        ann_dir='data/datasets/ld50k/ann_dir/val',
-        classes=ld50k_classes,
-        img_suffix='.png',
-        seg_suffix='.png',
-        ignore_index=255,
-        reduce_zero_label=False,
-        return_raw_image=True,
-        transforms=[
-            dict(type='ToTensor'),
-            dict(type='ConvertImageDtype'),
-            dict(type='ResizeLongestSide', long_side=1008),
-            dict(type='PadToSize', size=(1008, 1008), label_pad_value=255),
-        ],
-    ),
-    collate_fn=dict(
-        type='data.collate.OVSemanticCollator',
-        pad_size_divisor=14,
-        label_pad_value=255,
+        trainable_modules=[],
     ),
 )
 

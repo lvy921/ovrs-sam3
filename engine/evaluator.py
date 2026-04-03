@@ -6,8 +6,6 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
-from ..losses.target_converter import TargetConverter
-from ..models.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 from .visualization import VisualizationManager
 
 TensorDict = Dict[str, torch.Tensor]
