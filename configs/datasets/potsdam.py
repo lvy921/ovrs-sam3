@@ -1,7 +1,6 @@
 potsdam_classes = [
-    'building', 'pervious_surface', 'impervious_surface', 'bare_soil',
-    'water', 'coniferous', 'deciduous', 'brushwood', 'vineyard',
-    'herbaceous_vegetation', 'agricultural_land', 'plowed_land', 'other'
+    'impervious surface', 'building', 'low vegetation',
+    'tree', 'car', 'clutter background'
 ]
 
 val_dataloader = dict(
@@ -12,8 +11,8 @@ val_dataloader = dict(
     persistent_workers=True,
     dataset=dict(
         type='data.dataset.OVSemanticSegDataset',
-        img_dir='data/PotsdamSplit/img_dir/val',
-        ann_dir='data/PotsdamSplit/ann_dir/val',
+        img_dir='data/datasets/PotsdamSplit/img_dir/val',
+        ann_dir='data/datasets/PotsdamSplit/ann_dir/val',
         classes=potsdam_classes,
         img_suffix='.png',
         seg_suffix='.png',

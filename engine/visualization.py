@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+import hashlib
 from PIL import Image
 
 @dataclass
@@ -21,7 +22,10 @@ class VisualizerConfig:
     save_ground_truth: bool = True
     save_dense_prediction: bool = True
 
-    max_samples: Optional[int] = None
+    vis_prob: float = 0.05
+    max_samples_per_epoch: Optional[int] = 50
+    vis_seed: int = 42
+
     image_folder_pattern: str = 'image_{image_id:06d}'
     ignore_index: int = 255
 
@@ -31,7 +35,7 @@ class VisualizationManager:
         self.cfg = cfg
         self.save_dir = Path(cfg.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self._num_saved = 0
+        self._saved_counts: Dict[Tuple[str, int], int] = {}
 
     @classmethod
     def from_cfg(
@@ -183,6 +187,44 @@ class VisualizationManager:
             raise ValueError(f'Expected logits [B,C,H,W], got {tuple(logits.shape)}')
         return logits.argmax(dim=1)
 
+    def _get_epoch_key(self, stage: str, epoch: Optional[int]) -> Tuple[str, int]:
+        return stage, (-1 if epoch is None else int(epoch))
+
+    def _get_saved_count(self, stage: str, epoch: Optional[int]) -> int:
+        key = self._get_epoch_key(stage, epoch)
+        return int(self._saved_counts.get(key, 0))
+
+    def _increase_saved_count(self, stage: str, epoch: Optional[int]) -> None:
+        key = self._get_epoch_key(stage, epoch)
+        self._saved_counts[key] = self._get_saved_count(stage, epoch) + 1
+
+    def _should_save_sample(
+            self,
+            image_id: int,
+            stage: str,
+            epoch: Optional[int],
+    ) -> bool:
+        if not self.should_save(stage):
+            return False
+
+        if self.cfg.vis_prob <= 0:
+            return False
+
+        saved_count = self._get_saved_count(stage, epoch)
+        if self.cfg.max_samples_per_epoch is not None:
+            if saved_count >= int(self.cfg.max_samples_per_epoch):
+                return False
+
+        if self.cfg.vis_prob >= 1.0:
+            return True
+
+        epoch_value = -1 if epoch is None else int(epoch)
+        token = f'{self.cfg.vis_seed}:{stage}:{epoch_value}:{int(image_id)}'
+        digest = hashlib.sha1(token.encode('utf-8')).hexdigest()
+        value = int(digest[:8], 16) / float(16 ** 8 - 1)
+
+        return value < float(self.cfg.vis_prob)
+
     def save_semantic_batch(
         self,
         batch: Any,
@@ -217,12 +259,16 @@ class VisualizationManager:
         bsz = int(fused_logits.shape[0])
 
         for b in range(bsz):
-            if self.cfg.max_samples is not None and self._num_saved >= self.cfg.max_samples:
-                return
-
             image_id = self._extract_image_id(batch, b)
-            sample_dir = self._resolve_sample_dir(image_id=image_id, epoch=epoch, stage=stage)
 
+            if not self._should_save_sample(
+                    image_id=image_id,
+                    stage=stage,
+                    epoch=epoch,
+            ):
+                continue
+
+            sample_dir = self._resolve_sample_dir(image_id=image_id, epoch=epoch, stage=stage)
             image = self._extract_original_image(batch, b)
             out_hw = image.size[::-1]
 
@@ -259,4 +305,4 @@ class VisualizationManager:
             except Exception:
                 pass
 
-            self._num_saved += 1
+            self._increase_saved_count(stage, epoch)

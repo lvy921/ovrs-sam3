@@ -2,32 +2,12 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import fields, is_dataclass
 from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
-from .visualization import VisualizationManager
-
 TensorDict = Dict[str, torch.Tensor]
-
-
-def move_batch_to_device(obj, device: torch.device):
-    if isinstance(obj, torch.Tensor):
-        return obj.to(device, non_blocking=True)
-    if is_dataclass(obj):
-        for field in fields(obj):
-            setattr(obj, field.name, move_batch_to_device(getattr(obj, field.name), device))
-        return obj
-    if isinstance(obj, dict):
-        return {k: move_batch_to_device(v, device) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [move_batch_to_device(v, device) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(move_batch_to_device(v, device) for v in obj)
-    return obj
-
 
 class MulticlassSemanticEvaluator:
     def __init__(self, ignore_index: int = 255):
@@ -241,30 +221,114 @@ def inference_with_tta(
 
     return merged_outputs
 
-@torch.no_grad()
-def evaluate_model(
-    model,
-    dataloader,
-    device: torch.device | str = 'cuda',
-    visualizer: Optional[VisualizationManager] = None,
-    epoch: Optional[int] = None,
-    stage: str = 'val',
-    tta_cfg: Optional[Dict] = None,
-) -> Dict[str, float]:
-    device = torch.device(device)
-    model.eval()
+def _format_ascii_table(headers: list[str], rows: list[list[str]]) -> str:
+    if not headers:
+        return ''
 
-    evaluator = MulticlassSemanticEvaluator()
+    all_rows = [headers] + rows
+    col_widths = []
+    for col_id in range(len(headers)):
+        width = max(len(str(row[col_id])) for row in all_rows)
+        col_widths.append(width)
 
-    for batch in dataloader:
-        batch = move_batch_to_device(batch, device)
+    def _format_row(row: list[str]) -> str:
+        cells = []
+        for i, cell in enumerate(row):
+            cells.append(f' {str(cell).ljust(col_widths[i])} ')
+        return '|' + '|'.join(cells) + '|'
 
-        outputs = inference_with_tta(model, batch, tta_cfg=tta_cfg)
+    border = '+' + '+'.join('-' * (w + 2) for w in col_widths) + '+'
 
-        targets = {'label_map': batch.find_targets[0].semantic_label_map}
-        evaluator.update(outputs, targets)
+    lines = [border, _format_row(headers), border]
+    for row in rows:
+        lines.append(_format_row(row))
+    lines.append(border)
+    return '\n'.join(lines)
 
-        if visualizer is not None:
-            visualizer.save_semantic_batch(batch, outputs, targets, epoch=epoch, stage=stage)
+def _collect_semantic_metric_rows(
+    metric_stats: Dict[str, float],
+    class_names: Optional[Sequence[str]] = None,
+) -> tuple[list[list[str]], list[list[str]]]:
+    summary_rows: list[list[str]] = []
+    per_class_rows: list[list[str]] = []
 
-    return evaluator.compute()
+    if 'semantic.miou' in metric_stats:
+        summary_rows.append(['mIoU', f"{metric_stats['semantic.miou'] * 100.0:.2f}"])
+    if 'semantic.macc' in metric_stats:
+        summary_rows.append(['mAcc', f"{metric_stats['semantic.macc'] * 100.0:.2f}"])
+    if 'semantic.pixel_acc' in metric_stats:
+        summary_rows.append(['aAcc', f"{metric_stats['semantic.pixel_acc'] * 100.0:.2f}"])
+
+    class_ids = []
+    for key in metric_stats.keys():
+        if key.startswith('semantic.iou_class_'):
+            cls_id = int(key.rsplit('_', 1)[-1])
+            class_ids.append(cls_id)
+    class_ids = sorted(set(class_ids))
+
+    for cls_id in class_ids:
+        class_name = f'class_{cls_id}'
+        if class_names is not None and cls_id < len(class_names):
+            class_name = str(class_names[cls_id])
+
+        iou_key = f'semantic.iou_class_{cls_id}'
+        acc_key = f'semantic.acc_class_{cls_id}'
+
+        iou = metric_stats.get(iou_key, float('nan'))
+        acc = metric_stats.get(acc_key, float('nan'))
+
+        per_class_rows.append([
+            str(cls_id),
+            class_name,
+            f'{iou * 100.0:.2f}',
+            f'{acc * 100.0:.2f}',
+        ])
+
+    return summary_rows, per_class_rows
+
+def format_semantic_metric_tables(
+    metric_stats: Dict[str, float],
+    class_names: Optional[Sequence[str]] = None,
+) -> tuple[str, str]:
+    summary_rows, per_class_rows = _collect_semantic_metric_rows(
+        metric_stats=metric_stats,
+        class_names=class_names,
+    )
+
+    summary_table = ''
+    per_class_table = ''
+
+    if summary_rows:
+        summary_table = _format_ascii_table(
+            headers=['Metric', 'Value'],
+            rows=summary_rows,
+        )
+
+    if per_class_rows:
+        per_class_table = _format_ascii_table(
+            headers=['Class ID', 'Class Name', 'IoU', 'Acc'],
+            rows=per_class_rows,
+        )
+
+    return summary_table, per_class_table
+
+def extract_semantic_targets_from_batch(batch) -> Dict[str, torch.Tensor]:
+    return {
+        'label_map': batch.find_targets[0].semantic_label_map,
+    }
+
+def extract_class_names_from_batch(batch) -> Optional[List[str]]:
+    try:
+        class_names = batch.find_metadatas[0].class_names
+        return [str(x) for x in class_names]
+    except Exception:
+        return None
+
+def update_evaluator_with_batch(
+    evaluator: MulticlassSemanticEvaluator,
+    outputs: Dict[str, torch.Tensor],
+    batch,
+) -> Dict[str, torch.Tensor]:
+    targets = extract_semantic_targets_from_batch(batch)
+    evaluator.update(outputs, targets)
+    return targets

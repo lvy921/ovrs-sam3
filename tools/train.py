@@ -30,7 +30,6 @@ if __package__ in (None, ''):
     TrainerConfig = _trainer_mod.TrainerConfig
     _hooks_mod = import_module(f'{package_name}.engine.hooks')
     LoggerHook = _hooks_mod.LoggerHook
-    CheckpointHook = _hooks_mod.CheckpointHook
     _vis_mod = import_module(f'{package_name}.engine.visualization')
     VisualizationManager = _vis_mod.VisualizationManager
     _sem_mod = import_module(f'{package_name}.losses.semantic_criterion')
@@ -42,7 +41,6 @@ if __package__ in (None, ''):
 else:
     from ..data.build import build_dataloader
     from ..engine.config import Config
-    from ..engine.hooks import CheckpointHook, LoggerHook
     from ..engine.optimizer_builder import build_optimizer, build_scheduler
     from ..engine.trainer import Trainer, TrainerConfig
     from ..engine.visualization import VisualizationManager
@@ -79,21 +77,15 @@ def build_criterion(cfg: Dict[str, Any]):
 
 
 def build_hooks(cfg) -> List[object]:
-    hooks = []
-    default_hooks = cfg.get('default_hooks', {}) or {}
-    logger_cfg = default_hooks.get('logger') or {'interval': int(cfg.train_cfg.get('log_interval', 20))}
-    hooks.append(LoggerHook(interval=int(logger_cfg.get('interval', cfg.train_cfg.get('log_interval', 20)))))
-
-    ckpt_cfg = default_hooks.get('checkpoint') or {}
-    hooks.append(
-        CheckpointHook(
-            interval=int(ckpt_cfg.get('interval', cfg.train_cfg.get('save_interval', 1))),
-            save_best=bool(ckpt_cfg.get('save_best', True)),
-            monitor=str(ckpt_cfg.get('monitor', cfg.train_cfg.get('monitor', 'total_loss'))),
-            mode=str(ckpt_cfg.get('mode', cfg.train_cfg.get('monitor_mode', 'min'))),
+    logger_cfg = cfg.default_hooks['logger']
+    return [
+        LoggerHook(
+            interval=int(logger_cfg['interval']),
+            val_interval=int(logger_cfg['val_interval']),
+            print_metric_tables=bool(logger_cfg.get('print_metric_tables', True)),
+            print_per_class_metrics=bool(logger_cfg.get('print_per_class_metrics', True)),
         )
-    )
-    return hooks
+    ]
 
 
 def main():
@@ -125,7 +117,7 @@ def main():
 
     trainer_cfg = TrainerConfig(
         max_epochs=int(cfg.train_cfg.max_epochs),
-        log_interval=int(cfg.train_cfg.get('log_interval', 20)),
+        log_window_size=int(cfg.train_cfg.get('log_window_size', 20)),
         use_amp=bool(cfg.train_cfg.get('use_amp', True)),
         grad_clip_norm=cfg.train_cfg.get('grad_clip_norm', 0.1),
         save_dir=str(work_dir),
@@ -154,15 +146,14 @@ def main():
             val_dataloader=val_loader,
             lr_scheduler=None,
             cfg=trainer_cfg,
-            hooks=[],
+            hooks=build_hooks(cfg),
             visualizer=visualizer,
         )
 
         if args.resume_from:
             trainer.resume_from(args.resume_from)
 
-        stats = trainer.val_epoch(epoch=args.eval_epoch)
-        print('eval-only stats:', stats)
+        trainer.val_epoch(epoch=args.eval_epoch)
         return
 
     print('Building train_dataloader...')

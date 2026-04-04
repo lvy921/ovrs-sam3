@@ -5,27 +5,33 @@ import time
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence
+from collections import deque
 
 import torch
 from torch.amp import GradScaler, autocast
 
 from .checkpoint import CheckpointManager, CheckpointManagerConfig
-from .evaluator import evaluate_model
-from .hooks import Hook, HookManager, LoggerHook
+from .evaluator import (
+    MulticlassSemanticEvaluator,
+    extract_class_names_from_batch,
+    extract_semantic_targets_from_batch,
+    inference_with_tta,
+)
+from .hooks import Hook, HookManager
 from .visualization import VisualizationManager
 
 
 @dataclass
 class TrainerConfig:
     max_epochs: int = 12
-    log_interval: int = 20
+    log_window_size: int = 20
     use_amp: bool = True
     grad_clip_norm: Optional[float] = 0.1
     save_dir: str = './work_dirs/default'
     save_interval: int = 1
     eval_interval: int = 1
-    monitor: str = 'total_loss'
-    monitor_mode: str = 'min'
+    monitor: str = 'semantic.miou'
+    monitor_mode: str = 'max'
     max_keep_ckpts: int = 5
     device: str = 'cuda'
     auto_resume: bool = False
@@ -60,7 +66,7 @@ class Trainer:
         self.model.to(self.device)
         self.visualizer = visualizer
 
-        self.hook_manager = HookManager(hooks or [LoggerHook(interval=self.cfg.log_interval)])
+        self.hook_manager = HookManager(hooks or [])
         self.checkpoint_manager = checkpoint_manager or CheckpointManager(
             CheckpointManagerConfig(
                 save_dir=str(self.save_dir),
@@ -72,6 +78,28 @@ class Trainer:
             )
         )
         self.start_epoch = 1
+        self.iters_per_epoch = None
+        if self.train_dataloader is not None and hasattr(self.train_dataloader, '__len__'):
+            self.iters_per_epoch = len(self.train_dataloader)
+
+        self.max_iters = None
+        if self.iters_per_epoch is not None:
+            self.max_iters = self.cfg.max_epochs * self.iters_per_epoch
+
+        self.global_iter = 0
+        self.log_state: Dict[str, object] = {}
+
+        self._iter_time_history = deque(maxlen=self.cfg.log_window_size)
+        self._data_time_history = deque(maxlen=self.cfg.log_window_size)
+        self._train_stat_history = deque(maxlen=self.cfg.log_window_size)
+
+        self.val_iters_per_epoch = None
+        if self.val_dataloader is not None and hasattr(self.val_dataloader, '__len__'):
+            self.val_iters_per_epoch = len(self.val_dataloader)
+
+        self._val_iter_time_history = deque(maxlen=self.cfg.log_window_size)
+        self._val_data_time_history = deque(maxlen=self.cfg.log_window_size)
+        self._val_stat_history = deque(maxlen=self.cfg.log_window_size)
 
     def maybe_resume_latest(self):
         if not self.cfg.auto_resume:
@@ -139,14 +167,28 @@ class Trainer:
         self.scaler.update()
         return {k: float(v.detach().item()) for k, v in loss_dict.items() if torch.is_tensor(v) and v.ndim == 0}
 
-    @torch.no_grad()
-    def val_step(self, batch) -> Dict[str, float]:
-        self.model.eval()
-        batch = self._move_to_device(batch)
+    def _forward_val_outputs(self, batch) -> Dict[str, torch.Tensor]:
         use_amp = self.cfg.use_amp and self.device.type == 'cuda'
         with autocast(device_type=self.device.type, enabled=use_amp):
-            loss_dict = self._compute_losses(batch)
-        return {k: float(v.detach().item()) for k, v in loss_dict.items() if torch.is_tensor(v) and v.ndim == 0}
+            outputs = inference_with_tta(self.model, batch, tta_cfg=self.cfg.tta_cfg)
+        return outputs
+
+    def _compute_val_losses(
+            self,
+            outputs: Dict[str, torch.Tensor],
+            batch,
+    ) -> Dict[str, float]:
+        targets = extract_semantic_targets_from_batch(batch)
+
+        use_amp = self.cfg.use_amp and self.device.type == 'cuda'
+        with autocast(device_type=self.device.type, enabled=use_amp):
+            loss_dict = self.criterion(outputs, targets)
+
+        return {
+            k: float(v.detach().item())
+            for k, v in loss_dict.items()
+            if torch.is_tensor(v) and v.ndim == 0
+        }
 
     @staticmethod
     def _average_stats(stats_list: list[Dict[str, float]]) -> Dict[str, float]:
@@ -160,36 +202,194 @@ class Trainer:
                 out[k] = sum(vals) / len(vals)
         return out
 
+    def _get_current_lrs(self) -> list[float]:
+        if self.optimizer is None:
+            return []
+        return [float(group['lr']) for group in self.optimizer.param_groups]
+
+    def _get_memory_mb(self) -> Optional[int]:
+        if self.device.type != 'cuda':
+            return None
+        return int(torch.cuda.max_memory_allocated(self.device) / 1024 / 1024)
+
+    @staticmethod
+    def _mean_of_history(values) -> float:
+        if not values:
+            return 0.0
+        return float(sum(values) / len(values))
+
+    def _update_train_log_state(
+        self,
+        epoch: int,
+        step: int,
+        stats: Dict[str, float],
+        data_time: float,
+        iter_time: float,
+    ) -> None:
+        self._data_time_history.append(float(data_time))
+        self._iter_time_history.append(float(iter_time))
+        self._train_stat_history.append(dict(stats))
+
+        avg_data_time = self._mean_of_history(self._data_time_history)
+        avg_iter_time = self._mean_of_history(self._iter_time_history)
+        avg_stats = self._average_stats(list(self._train_stat_history))
+
+        eta_seconds = None
+        if self.max_iters is not None:
+            remaining_iters = max(self.max_iters - self.global_iter, 0)
+            eta_seconds = avg_iter_time * remaining_iters
+
+        self.log_state = {
+            'mode': 'train',
+            'epoch': int(epoch),
+            'max_epochs': int(self.cfg.max_epochs),
+            'iter': int(step),
+            'iters_per_epoch': self.iters_per_epoch,
+            'global_iter': int(self.global_iter),
+            'max_iters': self.max_iters,
+            'lrs': self._get_current_lrs(),
+            'eta_seconds': eta_seconds,
+            'iter_time': avg_iter_time,
+            'data_time': avg_data_time,
+            'memory_mb': self._get_memory_mb(),
+            'log_vars': avg_stats,
+        }
+
+    def _update_val_log_state(
+        self,
+        epoch: int,
+        step: int,
+        stats: Dict[str, float],
+        data_time: float,
+        iter_time: float,
+    ) -> None:
+        self._val_data_time_history.append(float(data_time))
+        self._val_iter_time_history.append(float(iter_time))
+        self._val_stat_history.append(dict(stats))
+
+        avg_data_time = self._mean_of_history(self._val_data_time_history)
+        avg_iter_time = self._mean_of_history(self._val_iter_time_history)
+        avg_stats = self._average_stats(list(self._val_stat_history))
+
+        eta_seconds = None
+        if self.val_iters_per_epoch is not None:
+            remaining_iters = max(self.val_iters_per_epoch - step, 0)
+            eta_seconds = avg_iter_time * remaining_iters
+
+        self.log_state = {
+            'mode': 'val_loss',
+            'epoch': int(epoch),
+            'max_epochs': int(self.cfg.max_epochs),
+            'iter': int(step),
+            'iters_per_epoch': self.val_iters_per_epoch,
+            'eta_seconds': eta_seconds,
+            'iter_time': avg_iter_time,
+            'data_time': avg_data_time,
+            'log_vars': avg_stats,
+        }
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.hook_manager.call('before_train_epoch', self, epoch)
         epoch_stats: list[Dict[str, float]] = []
+
+        end = time.perf_counter()
+
         for it, batch in enumerate(self.train_dataloader, start=1):
+            data_time = time.perf_counter() - end
+
+            if self.device.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats(self.device)
+
             self.hook_manager.call('before_train_iter', self, epoch, it, batch)
+
             stats = self.train_step(batch)
             epoch_stats.append(stats)
+
+            iter_time = time.perf_counter() - end
+
+            self.global_iter += 1
+            self._update_train_log_state(
+                epoch=epoch,
+                step=it,
+                stats=stats,
+                data_time=data_time,
+                iter_time=iter_time,
+            )
+
             self.hook_manager.call('after_train_iter', self, epoch, it, batch, stats)
+
+            end = time.perf_counter()
 
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
+
         train_stats = self._average_stats(epoch_stats)
         self.hook_manager.call('after_train_epoch', self, epoch, train_stats)
         return train_stats
 
+    @torch.no_grad()
     def val_epoch(self, epoch: int) -> Dict[str, float]:
         if self.val_dataloader is None:
             return {}
-        stats_list = [self.val_step(batch) for batch in self.val_dataloader]
+
+        self.hook_manager.call('before_val_epoch', self, epoch)
+
+        self.model.eval()
+        self._val_iter_time_history.clear()
+        self._val_data_time_history.clear()
+        self._val_stat_history.clear()
+
+        evaluator = MulticlassSemanticEvaluator()
+        stats_list: list[Dict[str, float]] = []
+        class_names = None
+
+        end = time.perf_counter()
+
+        for it, batch in enumerate(self.val_dataloader, start=1):
+            data_time = time.perf_counter() - end
+
+            batch = self._move_to_device(batch)
+
+            outputs = self._forward_val_outputs(batch)
+            loss_stats = self._compute_val_losses(outputs, batch)
+            stats_list.append(loss_stats)
+
+            targets = extract_semantic_targets_from_batch(batch)
+            evaluator.update(outputs, targets)
+
+            if class_names is None:
+                class_names = extract_class_names_from_batch(batch)
+
+            if self.visualizer is not None:
+                self.visualizer.save_semantic_batch(
+                    batch=batch,
+                    semantic_outputs=outputs,
+                    semantic_targets=targets,
+                    epoch=epoch,
+                    stage='val',
+                )
+
+            iter_time = time.perf_counter() - end
+
+            self._update_val_log_state(
+                epoch=epoch,
+                step=it,
+                stats=loss_stats,
+                data_time=data_time,
+                iter_time=iter_time,
+            )
+
+            self.hook_manager.call('after_val_iter', self, epoch, it, batch, loss_stats)
+
+            end = time.perf_counter()
+
         loss_stats = self._average_stats(stats_list)
-        metric_stats = evaluate_model(
-            self.model,
-            self.val_dataloader,
-            device=self.device,
-            visualizer=self.visualizer,
-            epoch=epoch,
-            stage='val',
-            tta_cfg=self.cfg.tta_cfg,
-        )
+        metric_stats = evaluator.compute()
+
         stats = {**loss_stats, **metric_stats}
+        if class_names is not None:
+            stats['_class_names'] = class_names
+
         self.hook_manager.call('after_val_epoch', self, epoch, stats)
         return stats
 
@@ -212,7 +412,6 @@ class Trainer:
                 'monitor_mode': self.cfg.monitor_mode,
             },
         )
-        self.hook_manager.call('after_save_checkpoint', self, epoch, str(ckpt_path))
         return ckpt_path
 
     def train(self):

@@ -9,7 +9,10 @@ visualization = dict(
     save_ground_truth=True,
     save_dense_prediction=True,
 
-    max_samples=None,
+    vis_prob=0.05,
+    max_samples_per_epoch=50,
+    vis_seed=42,
+
     image_folder_pattern='image_{image_id:06d}',
     ignore_index=255,
 )
