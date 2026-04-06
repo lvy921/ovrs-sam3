@@ -90,7 +90,7 @@ class SegmentorBuildConfig:
 
     semantic_aggregation: str = "max"
 
-    semantic_use_query_branch: bool = True
+    semantic_use_instance_branch: bool = True
     semantic_use_semantic_branch: bool = True
     semantic_fusion_mode: str = "max"
 
@@ -408,13 +408,13 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @staticmethod
     def validate_semantic_cfg(cfg: SegmentorBuildConfig) -> None:
-        if not cfg.semantic_use_query_branch and not cfg.semantic_use_semantic_branch:
+        if not cfg.semantic_use_instance_branch and not cfg.semantic_use_semantic_branch:
             raise ValueError(
                 "At least one semantic branch must be enabled: "
-                "semantic_use_query_branch or semantic_use_semantic_branch."
+                "semantic_use_instance_branch or semantic_use_semantic_branch."
             )
 
-        valid_fusion_modes = {"query_only", "semantic_only", "max", "sum"}
+        valid_fusion_modes = {"instance_only", "semantic_only", "max", "sum"}
         if cfg.semantic_fusion_mode not in valid_fusion_modes:
             raise ValueError(
                 f"Unknown semantic_fusion_mode: {cfg.semantic_fusion_mode}. "
@@ -493,7 +493,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
             core=sam3_image_model,
             semantic_adapter=QueryMaskSemanticAdapter(
                 aggregation=cfg.semantic_aggregation,
-                use_query_branch=cfg.semantic_use_query_branch,
+                use_instance_branch=cfg.semantic_use_instance_branch,
                 use_semantic_branch=cfg.semantic_use_semantic_branch,
                 fusion_mode=cfg.semantic_fusion_mode,
                 use_presence_score=cfg.semantic_use_presence_score,

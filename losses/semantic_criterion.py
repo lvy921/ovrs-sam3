@@ -102,10 +102,10 @@ class SemanticCriterion(nn.Module):
         return logits.sum() * 0.0
 
     def forward(self, outputs: TensorDict, targets: TensorDict) -> TensorDict:
-        if "semantic_logits" not in outputs:
-            raise ValueError("semantic_logits is required in semantic outputs.")
+        if "fused_score_map" not in outputs:
+            raise ValueError("fused_score_map is required in semantic outputs.")
 
-        semantic_logits = outputs["semantic_logits"]   # [B, C, H, W]
+        semantic_logits = outputs["fused_score_map"]   # [B, C, H, W]
         target = self._prepare_target(
             targets=targets,
             out_hw=semantic_logits.shape[-2:],

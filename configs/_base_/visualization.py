@@ -7,7 +7,7 @@ visualization = dict(
     save_original=True,
     save_prediction=True,
     save_ground_truth=True,
-    save_dense_prediction=True,
+    save_semantic_prediction=True,
 
     vis_prob=0.05,
     max_samples_per_epoch=50,

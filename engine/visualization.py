@@ -20,7 +20,7 @@ class VisualizerConfig:
     save_original: bool = True
     save_prediction: bool = True
     save_ground_truth: bool = True
-    save_dense_prediction: bool = True
+    save_semantic_prediction: bool = True
 
     vis_prob: float = 0.05
     max_samples_per_epoch: Optional[int] = 50
@@ -177,10 +177,6 @@ class VisualizationManager:
     def _extract_pred_from_logits(
         logits: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        """
-        输入 logits: [B, C, H, W]
-        输出 pred:   [B, H, W]
-        """
         if logits is None:
             return None
         if logits.dim() != 4:
@@ -237,14 +233,14 @@ class VisualizationManager:
         if not self.should_save(stage):
             return
 
-        if 'semantic_logits' not in semantic_outputs:
-            raise ValueError("semantic_outputs must contain 'semantic_logits'.")
+        if 'fused_score_map' not in semantic_outputs:
+            raise ValueError("outputs must contain 'fused_score_map'.")
 
-        fused_logits = semantic_outputs['semantic_logits']             # [B,C,H,W]
-        fused_pred = self._extract_pred_from_logits(fused_logits)     # [B,H,W]
+        fused_score_map = semantic_outputs['fused_score_map']             # [B,C,H,W]
+        fused_pred = self._extract_pred_from_logits(fused_score_map)     # [B,H,W]
 
-        dense_logits = semantic_outputs.get('semantic_logits_dense', None)
-        dense_pred = self._extract_pred_from_logits(dense_logits) if dense_logits is not None else None
+        semantic_score_map = semantic_outputs.get('semantic_score_map', None)
+        semantic_pred = self._extract_pred_from_logits(semantic_score_map) if semantic_score_map is not None else None
 
         gt = semantic_targets['label_map']                            # [B,H,W]
 
@@ -255,8 +251,8 @@ class VisualizationManager:
         if gt.dim() != 3:
             raise ValueError(f'Expected gt [B,H,W], got {tuple(gt.shape)}')
 
-        num_classes = int(fused_logits.shape[1])
-        bsz = int(fused_logits.shape[0])
+        num_classes = int(fused_score_map.shape[1])
+        bsz = int(fused_score_map.shape[0])
 
         for b in range(bsz):
             image_id = self._extract_image_id(batch, b)
@@ -275,9 +271,9 @@ class VisualizationManager:
             fused_pred_label = self._prepare_label_map(fused_pred[b], out_hw)
             gt_label = self._prepare_label_map(gt[b], out_hw)
 
-            dense_pred_label = None
-            if dense_pred is not None:
-                dense_pred_label = self._prepare_label_map(dense_pred[b], out_hw)
+            semantic_pred_label = None
+            if semantic_pred is not None:
+                semantic_pred_label = self._prepare_label_map(semantic_pred[b], out_hw)
 
             if self.cfg.save_original:
                 image.save(sample_dir / 'original.png')
@@ -287,8 +283,8 @@ class VisualizationManager:
                     sample_dir / 'pred_overlay.png'
                 )
 
-            if self.cfg.save_dense_prediction and dense_pred_label is not None:
-                self._overlay_label_map(image, dense_pred_label, num_classes).save(
+            if self.cfg.save_semantic_prediction and semantic_pred_label is not None:
+                self._overlay_label_map(image, semantic_pred_label, num_classes).save(
                     sample_dir / 'pred_semantic_overlay.png'
                 )
 

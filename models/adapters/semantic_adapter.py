@@ -10,24 +10,10 @@ from ..data_misc import BatchedDatapoint
 
 
 class QueryMaskSemanticAdapter(nn.Module):
-    """
-    Consume class-structured SAM3 outputs and produce multi-class semantic logits.
-
-    Expected raw output shapes from sam3_image.py:
-        pred_masks:        [B, C, Q, H, W]
-        pred_logits:       [B, C, Q, 1]
-        semantic_seg:      [B, C, 1, H, W]  or [B, C, H, W]
-        presence_logit:    [B, C] or [B, C, 1]
-        presence_logit_dec:[B, C, Q]
-
-    Output:
-        semantic_logits:   [B, C, H, W]
-    """
-
     def __init__(
         self,
         aggregation: str = "max",
-        use_query_branch: bool = True,
+        use_instance_branch: bool = True,
         use_semantic_branch: bool = True,
         fusion_mode: str = "max",
         use_presence_score: bool = True,
@@ -36,36 +22,38 @@ class QueryMaskSemanticAdapter(nn.Module):
         super().__init__()
         self.aggregation = aggregation
 
-        self.use_query_branch = bool(use_query_branch)
+        self.use_instance_branch = bool(use_instance_branch)
         self.use_semantic_branch = bool(use_semantic_branch)
         self.fusion_mode = fusion_mode
 
         self.use_presence_score = bool(use_presence_score)
         self.confidence_threshold = confidence_threshold
 
-    def _extract_query_presence_prob(
+    def _extract_presence_prob(
             self,
             raw_outputs: Dict[str, torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        presence_logit_dec = raw_outputs.get("presence_logit_dec", None)
-        if presence_logit_dec is None:
+        if not self.use_presence_score:
             return None
 
-        if presence_logit_dec.dim() == 4:
-            if presence_logit_dec.shape[-1] != 1:
+        presence_logit_dec = raw_outputs.get("presence_logit_dec", None)
+        if presence_logit_dec is not None:
+            if presence_logit_dec.dim() == 3:
+                if presence_logit_dec.shape[-1] != 1:
+                    raise ValueError(
+                        f"Expected presence_logit_dec as [B, C, 1], got {tuple(presence_logit_dec.shape)}"
+                    )
+                presence_logit_dec = presence_logit_dec.squeeze(-1)
+            elif presence_logit_dec.dim() != 2:
                 raise ValueError(
-                    f"Expected presence_logit_dec as [B, C, Q, 1], got {tuple(presence_logit_dec.shape)}"
+                    f"Expected presence_logit_dec as [B, C] or [B, C, 1], got {tuple(presence_logit_dec.shape)}"
                 )
-            presence_logit_dec = presence_logit_dec.squeeze(-1)
 
-        if presence_logit_dec.dim() != 3:
-            raise ValueError(
-                f"Expected presence_logit_dec as [B, C, Q], got {tuple(presence_logit_dec.shape)}"
-            )
+            return presence_logit_dec.sigmoid()  # [B, C]
 
-        return presence_logit_dec.sigmoid()  # [B, C, Q]
+        return None
 
-    def _aggregate_query_logits(
+    def _aggregate_instance_logits(
             self,
             pred_logits: torch.Tensor,  # [B, C, Q, 1]
             pred_masks: torch.Tensor,  # [B, C, Q, H, W]
@@ -86,36 +74,26 @@ class QueryMaskSemanticAdapter(nn.Module):
 
         query_scores = pred_logits.squeeze(-1).sigmoid()  # [B, C, Q]
 
-        query_presence = self._extract_query_presence_prob(raw_outputs)
-        if self.use_presence_score and query_presence is not None:
-            query_scores = query_scores * query_presence
-
-        pred_masks = pred_masks.sigmoid()  # [B, C, Q, H, W]
+        global_presence = self._extract_presence_prob(raw_outputs)  # [B, C] or None
+        if global_presence is not None:
+            query_scores = query_scores * global_presence[..., None]  # [B, C, Q]
 
         if self.confidence_threshold is not None:
             keep = query_scores > float(self.confidence_threshold)  # [B, C, Q]
-        else:
-            keep = torch.ones_like(query_scores, dtype=torch.bool)
+            query_scores = query_scores * keep.to(query_scores.dtype)
 
-        keep_f = keep.to(dtype=pred_masks.dtype)
+        mask_probs = pred_masks.sigmoid()  # [B, C, Q, H, W]
 
         if self.aggregation == "max":
-            weighted_masks = pred_masks * query_scores[..., None, None] * keep_f[..., None, None]
-            query_logits = weighted_masks.max(dim=2).values  # [B, C, H, W]
+            query_logits = (mask_probs * query_scores[..., None, None]).amax(dim=2)
 
         elif self.aggregation == "weighted_sum":
-            filtered_scores = query_scores * keep_f
-            weights = filtered_scores / filtered_scores.sum(dim=2, keepdim=True).clamp(min=1e-6)
-            query_logits = (pred_masks * weights[..., None, None]).sum(dim=2)
+            weights = query_scores / query_scores.sum(dim=2, keepdim=True).clamp(min=1e-6)
+            query_logits = (mask_probs * weights[..., None, None]).sum(dim=2)
 
         elif self.aggregation == "logsumexp":
-            minus_inf = torch.full_like(pred_masks, -1e4)
-            masked = torch.where(
-                keep[..., None, None],
-                pred_masks * query_scores[..., None, None],
-                minus_inf,
-            )
-            query_logits = torch.logsumexp(masked, dim=2)
+            weighted = mask_probs * query_scores[..., None, None]
+            query_logits = torch.logsumexp(weighted.clamp(min=1e-6), dim=2)
 
         else:
             raise ValueError(f"Unknown aggregation: {self.aggregation}")
@@ -147,30 +125,6 @@ class QueryMaskSemanticAdapter(nn.Module):
 
         return semantic_seg.sigmoid()
 
-    def _extract_presence_prob(
-            self,
-            raw_outputs: Dict[str, torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if not self.use_presence_score:
-            return None
-
-        presence_logit = raw_outputs.get("presence_logit", None)
-        if presence_logit is None:
-            return None
-
-        if presence_logit.dim() == 3:
-            if presence_logit.shape[-1] != 1:
-                raise ValueError(
-                    f"Expected presence_logit as [B, C, 1], got {tuple(presence_logit.shape)}"
-                )
-            presence_logit = presence_logit.squeeze(-1)
-        elif presence_logit.dim() != 2:
-            raise ValueError(
-                f"Expected presence_logit as [B, C] or [B, C, 1], got {tuple(presence_logit.shape)}"
-            )
-
-        return presence_logit.sigmoid()  # [B, C]
-
     @staticmethod
     def _resize_to_match(
         x: Optional[torch.Tensor],
@@ -193,11 +147,11 @@ class QueryMaskSemanticAdapter(nn.Module):
         semantic_logits: Optional[torch.Tensor],   # [B, C, H, W] or None
     ) -> torch.Tensor:
         if query_logits is None and semantic_logits is None:
-            raise ValueError("At least one of query branch or semantic branch must be enabled.")
+            raise ValueError("At least one of instance branch or semantic branch must be enabled.")
 
-        if self.fusion_mode == "query_only":
+        if self.fusion_mode == "instance_only":
             if query_logits is None:
-                raise ValueError("fusion_mode='query_only' but query branch is missing.")
+                raise ValueError("fusion_mode='instance_only' but instance branch is missing.")
             return query_logits
 
         if self.fusion_mode == "semantic_only":
@@ -222,55 +176,61 @@ class QueryMaskSemanticAdapter(nn.Module):
         raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
 
     def forward(self, raw_outputs, batch: BatchedDatapoint):
-        query_branch_logits = None
-        if self.use_query_branch:
+        instance_branch_score_map = None
+        if self.use_instance_branch:
             pred_masks = raw_outputs.get("pred_masks", None)
             pred_logits = raw_outputs.get("pred_logits", None)
             if pred_masks is None or pred_logits is None:
                 raise ValueError(
-                    "Query branch is enabled, but pred_masks or pred_logits is missing."
+                    "Instance branch is enabled, but pred_masks or pred_logits is missing."
                 )
-            query_branch_logits = self._aggregate_query_logits(
+            instance_branch_score_map = self._aggregate_instance_logits(
                 pred_logits=pred_logits,
                 pred_masks=pred_masks,
                 raw_outputs=raw_outputs,
             )
 
-        semantic_branch_logits = None
+        semantic_branch_score_map = None
         if self.use_semantic_branch:
-            semantic_branch_logits = self._extract_semantic_branch(raw_outputs)
+            semantic_branch_score_map = self._extract_semantic_branch(raw_outputs)
 
         target_hw = None
-        if query_branch_logits is not None:
-            target_hw = tuple(query_branch_logits.shape[-2:])
-        elif semantic_branch_logits is not None:
-            target_hw = tuple(semantic_branch_logits.shape[-2:])
+        if instance_branch_score_map is not None:
+            target_hw = tuple(instance_branch_score_map.shape[-2:])
+        elif semantic_branch_score_map is not None:
+            target_hw = tuple(semantic_branch_score_map.shape[-2:])
 
         if target_hw is None:
             raise ValueError("Cannot determine target spatial size for semantic logits.")
 
-        query_branch_logits = self._resize_to_match(query_branch_logits, target_hw)
-        semantic_branch_logits = self._resize_to_match(semantic_branch_logits, target_hw)
+        instance_branch_score_map = self._resize_to_match(instance_branch_score_map, target_hw)
+        semantic_branch_score_map = self._resize_to_match(semantic_branch_score_map, target_hw)
 
-        fused_logits = self._fuse_branches(
-            query_logits=query_branch_logits,
-            semantic_logits=semantic_branch_logits,
+        fused_score_map = self._fuse_branches(
+            query_logits=instance_branch_score_map,
+            semantic_logits=semantic_branch_score_map,
         )
 
+        final_presence = self._extract_presence_prob(raw_outputs)
+        if final_presence is not None:
+            fused_score_map = fused_score_map * final_presence[..., None, None]
+
+        fused_pred = fused_score_map.argmax(dim=1)
+
         out = {
-            "semantic_logits": fused_logits,
-            "semantic_score_map": fused_logits,
+            "fused_score_map": fused_score_map,
+            "fused_pred": fused_pred,
         }
 
-        if query_branch_logits is not None:
-            out["semantic_logits_query"] = query_branch_logits
-        if semantic_branch_logits is not None:
-            out["semantic_logits_dense"] = semantic_branch_logits
+        if instance_branch_score_map is not None:
+            out["instance_score_map"] = instance_branch_score_map
+        if semantic_branch_score_map is not None:
+            out["semantic_score_map"] = semantic_branch_score_map
 
         if len(batch.find_metadatas) > 0:
             meta = batch.find_metadatas[0]
             expected_num_classes = int(meta.num_classes)
-            actual_num_classes = int(fused_logits.shape[1])
+            actual_num_classes = int(fused_score_map.shape[1])
             if expected_num_classes != actual_num_classes:
                 raise ValueError(
                     f"Class count mismatch: metadata says {expected_num_classes}, "
