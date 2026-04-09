@@ -45,6 +45,8 @@ class Sam3Image(torch.nn.Module):
         detach_presence_in_joint_score: bool = False,  # only relevant if using presence token/score
         separate_scorer_for_instance: bool = False,
         num_interactive_steps_val: int = 0,
+        clip_image_encoder=None,
+        clip_text_encoder=None,
         **kwargs,
     ):
         super().__init__()
@@ -64,6 +66,8 @@ class Sam3Image(torch.nn.Module):
 
         self.num_interactive_steps_val = num_interactive_steps_val
         self.use_dot_prod_scoring = use_dot_prod_scoring
+        self.clip_image_encoder = clip_image_encoder
+        self.clip_text_encoder = clip_text_encoder
 
         if self.use_dot_prod_scoring:
             assert dot_prod_scoring is not None

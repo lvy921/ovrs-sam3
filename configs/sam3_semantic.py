@@ -3,7 +3,7 @@ _base_ = [
     './_base_/optimizer.py',
     './_base_/schedule.py',
     './_base_/visualization.py',
-    './datasets/isaid.py'
+    './datasets/ld50k.py'
 ]
 
 model = dict(
@@ -23,6 +23,17 @@ model = dict(
     semantic_use_presence_score=True,
     confidence_threshold=0.5,
     prompt_chunk_size=8,
+
+    openclip_cfg=dict(
+        enabled=True,
+        model_name='ViT-L-14',
+        pretrained=None,
+        checkpoint_path='weights/RemoteCLIP-ViT-L-14.pt',
+
+        freeze_visual=True,
+        freeze_text=True,
+        freeze_logit_scale=True,
+    ),
 
     freeze_cfg=dict(
         train_adapters_only=False,

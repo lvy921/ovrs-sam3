@@ -31,6 +31,8 @@ from .models.text_encoder_ve import VETextEncoder
 from .models.tokenizer_ve import SimpleTokenizer
 from .models.vitdet import ViT
 from .models.vl_combiner import SAM3VLBackbone
+from .models.openclip_image_encoder import OpenCLIPImageEncoder
+from .models.openclip_text_encoder import OpenCLIPTextEncoder
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -78,6 +80,16 @@ class FreezeConfig:
     trainable_modules: list[str] = field(default_factory=list)
     frozen_modules: list[str] = field(default_factory=list)
 
+@dataclass
+class OpenCLIPConfig:
+    enabled: bool = False
+    model_name: str = "ViT-L-14"
+    pretrained: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+
+    freeze_visual: bool = False
+    freeze_text: bool = False
+    freeze_logit_scale: bool = True
 
 @dataclass
 class SegmentorBuildConfig:
@@ -100,6 +112,7 @@ class SegmentorBuildConfig:
     prompt_chunk_size: Optional[int] = None
 
     freeze_cfg: FreezeConfig = field(default_factory=FreezeConfig)
+    openclip_cfg: OpenCLIPConfig = field(default_factory=OpenCLIPConfig)
 
 
 class FrozenModuleMixin:
@@ -208,6 +221,73 @@ class SAM3ModelBuilder(FrozenModuleMixin):
     @staticmethod
     def _create_vl_backbone(vit_neck, text_encoder):
         return SAM3VLBackbone(visual=vit_neck, text=text_encoder, scalp=1)
+
+    @staticmethod
+    def _create_openclip_bundle(openclip_cfg: OpenCLIPConfig):
+        import open_clip
+
+        clip_model, _, _ = open_clip.create_model_and_transforms(
+            model_name=openclip_cfg.model_name,
+            pretrained=openclip_cfg.pretrained,
+        )
+
+        if openclip_cfg.checkpoint_path is not None:
+            with g_pathmgr.open(openclip_cfg.checkpoint_path, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
+            state_dict = SAM3ModelBuilder._unwrap_state_dict(ckpt)
+            missing_keys, unexpected_keys = clip_model.load_state_dict(state_dict, strict=False)
+            if len(missing_keys) > 0 or len(unexpected_keys) > 0:
+                print(
+                    f"Loaded {openclip_cfg.checkpoint_path} with "
+                    f"missing_keys={missing_keys} and unexpected_keys={unexpected_keys}"
+                )
+
+        tokenizer = open_clip.get_tokenizer(openclip_cfg.model_name)
+
+        return {
+            "clip_model": clip_model,
+            "tokenizer": tokenizer,
+            "visual": clip_model.visual,
+            "token_embedding": clip_model.token_embedding,
+            "positional_embedding": clip_model.positional_embedding,
+            "transformer": clip_model.transformer,
+            "ln_final": clip_model.ln_final,
+            "attn_mask": getattr(clip_model, "attn_mask", None),
+            "context_length": getattr(clip_model, "context_length", 77),
+            "logit_scale": getattr(clip_model, "logit_scale", None),
+        }
+
+    @classmethod
+    def _create_clip_modules(cls, openclip_cfg):
+        bundle = cls._create_openclip_bundle(openclip_cfg)
+
+        text_width = getattr(bundle["transformer"], "width", None)
+        if text_width is None:
+            raise AttributeError(
+                "Cannot infer OpenCLIP text width from bundle['transformer']."
+            )
+
+        clip_image_encoder = OpenCLIPImageEncoder(
+            visual=bundle["visual"],
+            default_output="feat_map",
+        )
+
+        clip_text_encoder = OpenCLIPTextEncoder(
+            tokenizer=bundle["tokenizer"],
+            token_embedding=bundle["token_embedding"],
+            positional_embedding=bundle["positional_embedding"],
+            transformer=bundle["transformer"],
+            ln_final=bundle["ln_final"],
+            attn_mask=bundle["attn_mask"],
+            context_length=bundle["context_length"],
+            width=text_width,
+            d_model=256,
+        )
+
+        return {
+            "clip_image_encoder": clip_image_encoder,
+            "clip_text_encoder": clip_text_encoder,
+        }
 
     @staticmethod
     def _create_transformer_encoder() -> TransformerEncoderFusion:
@@ -370,6 +450,8 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         input_geometry_encoder,
         segmentation_head,
         dot_prod_scoring,
+        clip_image_encoder=None,
+        clip_text_encoder=None,
     ):
         common_params = {
             "backbone": backbone,
@@ -382,6 +464,8 @@ class SAM3ModelBuilder(FrozenModuleMixin):
             "use_instance_query": False,
             "multimask_output": True,
             "matcher": None,
+            "clip_image_encoder": clip_image_encoder,
+            "clip_text_encoder": clip_text_encoder,
         }
         return Sam3Image(**common_params)
 
@@ -428,6 +512,26 @@ class SAM3ModelBuilder(FrozenModuleMixin):
                 f"Valid options are: {sorted(valid_aggregations)}"
             )
 
+    @staticmethod
+    def validate_openclip_cfg(openclip_cfg: OpenCLIPConfig) -> None:
+        if not openclip_cfg.enabled:
+            return
+
+        if openclip_cfg.pretrained is not None and openclip_cfg.checkpoint_path is not None:
+            raise ValueError(
+                "Only one of pretrained or checkpoint_path should be set for OpenCLIP."
+            )
+
+    @staticmethod
+    def _unwrap_state_dict(ckpt):
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+                return ckpt["state_dict"]
+            if "model" in ckpt and isinstance(ckpt["model"], dict):
+                return ckpt["model"]
+            return ckpt
+        raise TypeError(f"Unexpected checkpoint type: {type(ckpt)}")
+
     @classmethod
     def apply_freeze_cfg(cls, model: nn.Module, freeze_cfg: FreezeConfig) -> None:
         if freeze_cfg.train_adapters_only:
@@ -459,6 +563,14 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         vit_neck = cls._create_vit_neck(position_encoding, vit_backbone, enable_inst_interactivity=False)
         text_encoder = cls._create_text_encoder(bpe_path)
         backbone = cls._create_vl_backbone(vit_neck, text_encoder)
+
+        clip_image_encoder = None
+        clip_text_encoder = None
+        if cfg.openclip_cfg.enabled:
+            clip_modules = cls._create_clip_modules(cfg.openclip_cfg)
+            clip_image_encoder = clip_modules["clip_image_encoder"]
+            clip_text_encoder = clip_modules["clip_text_encoder"]
+
         transformer = cls._create_sam3_transformer()
         dot_prod_scoring = cls._create_dot_product_scoring()
         segmentation_head = cls._create_segmentation_head(compile_mode=compile_mode)
@@ -470,6 +582,8 @@ class SAM3ModelBuilder(FrozenModuleMixin):
             input_geometry_encoder=input_geometry_encoder,
             segmentation_head=segmentation_head,
             dot_prod_scoring=dot_prod_scoring,
+            clip_image_encoder=clip_image_encoder,
+            clip_text_encoder=clip_text_encoder,
         )
 
         checkpoint_path = cfg.checkpoint_path
@@ -482,6 +596,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_segmentor(cls, cfg: SegmentorBuildConfig) -> nn.Module:
+        cls.validate_openclip_cfg(cfg.openclip_cfg)
         cls.validate_semantic_cfg(cfg)
 
         sam3_image_model = cls.build_sam3_image_model(cfg)
