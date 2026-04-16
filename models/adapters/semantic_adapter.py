@@ -87,7 +87,6 @@ class QueryMaskSemanticAdapter(nn.Module):
                 f"Expected semantic_seg as [B, C, 1, H, W] or [B, C, H, W], got {tuple(semantic_seg.shape)}"
             )
 
-        # 这里返回原始 logits，不做 sigmoid
         return semantic_seg
 
     @staticmethod
@@ -121,13 +120,8 @@ class QueryMaskSemanticAdapter(nn.Module):
         pred_logits: torch.Tensor,
         pred_masks: torch.Tensor,
     ) -> torch.Tensor:
-        # pred_logits: [B, C, Q, 1]
-        # pred_masks:  [B, C, Q, H, W]
-        #
-        # 训练时在 logit 空间里聚合：
-        # 每个 query 的像素级 logit = mask_logit + query_score_logit
-        query_score_logits = pred_logits.squeeze(-1)[..., None, None]  # [B, C, Q, 1, 1]
-        return pred_masks + query_score_logits  # [B, C, Q, H, W]
+        query_score_logits = pred_logits.squeeze(-1)[..., None, None]
+        return pred_masks + query_score_logits
 
     def _aggregate_instance_logits_for_training(
         self,
@@ -155,13 +149,9 @@ class QueryMaskSemanticAdapter(nn.Module):
         pred_masks: torch.Tensor,
         raw_outputs: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # pred_logits: [B, C, Q, 1]
-        # pred_masks:  [B, C, Q, H, W]
-        #
-        # 推理时沿用 score-map 逻辑，query 先做置信度过滤，再沿 query 聚合。
-        query_scores = pred_logits.squeeze(-1).sigmoid()  # [B, C, Q]
+        query_scores = pred_logits.squeeze(-1).sigmoid()
 
-        presence_prob = self._extract_presence_prob(raw_outputs)  # [B, C] or None
+        presence_prob = self._extract_presence_prob(raw_outputs)
         if presence_prob is not None:
             query_scores = query_scores * presence_prob[..., None]
 
@@ -171,7 +161,7 @@ class QueryMaskSemanticAdapter(nn.Module):
         else:
             query_keep_mask = torch.ones_like(query_scores, dtype=torch.bool)
 
-        mask_probs = pred_masks.sigmoid()  # [B, C, Q, H, W]
+        mask_probs = pred_masks.sigmoid()
         mode = self.instance_infer_aggregation
 
         if mode == "max":
@@ -452,20 +442,43 @@ class QueryMaskSemanticAdapter(nn.Module):
         raw_outputs: Dict[str, torch.Tensor],
         batch: BatchedDatapoint,
         expected_num_classes: Optional[int] = None,
-    ) -> Dict[str, Dict[str, torch.Tensor]]:
-        train_outputs = self._build_train_outputs(
-            raw_outputs=raw_outputs,
-            batch=batch,
-            expected_num_classes=expected_num_classes,
-        )
+        output_mode: str = "both",
+    ) -> Dict[str, Dict[str, torch.Tensor]] | Dict[str, torch.Tensor]:
+        output_mode = str(output_mode)
 
-        inference_outputs = self._build_inference_outputs(
-            raw_outputs=raw_outputs,
-            batch=batch,
-            expected_num_classes=expected_num_classes,
-        )
+        if output_mode == "train":
+            return self._build_train_outputs(
+                raw_outputs=raw_outputs,
+                batch=batch,
+                expected_num_classes=expected_num_classes,
+            )
 
-        return {
-            "train_outputs": train_outputs,
-            "inference_outputs": inference_outputs,
-        }
+        if output_mode == "infer":
+            return self._build_inference_outputs(
+                raw_outputs=raw_outputs,
+                batch=batch,
+                expected_num_classes=expected_num_classes,
+            )
+
+        if output_mode == "both":
+            train_outputs = self._build_train_outputs(
+                raw_outputs=raw_outputs,
+                batch=batch,
+                expected_num_classes=expected_num_classes,
+            )
+
+            inference_outputs = self._build_inference_outputs(
+                raw_outputs=raw_outputs,
+                batch=batch,
+                expected_num_classes=expected_num_classes,
+            )
+
+            return {
+                "train_outputs": train_outputs,
+                "inference_outputs": inference_outputs,
+            }
+
+        raise ValueError(
+            f"Unknown output_mode={output_mode}. "
+            "Supported modes are: 'train', 'infer', 'both'."
+        )

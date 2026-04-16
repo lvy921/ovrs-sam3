@@ -29,7 +29,7 @@ class CheckpointManager:
         self.best_path = None
         self._load_meta()
 
-    def _load_meta(self):
+    def _load_meta(self) -> None:
         if not self.meta_path.exists():
             return
         try:
@@ -40,7 +40,7 @@ class CheckpointManager:
             self.best_score = None
             self.best_path = None
 
-    def _write_meta(self):
+    def _write_meta(self) -> None:
         meta = {
             "best_score": self.best_score,
             "best_path": self.best_path,
@@ -56,7 +56,10 @@ class CheckpointManager:
             return score > self.best_score
         raise ValueError(f"Unsupported mode: {self.cfg.mode}")
 
-    def save(
+    def _checkpoint_path(self, global_iter: int) -> Path:
+        return self.save_dir / f"iter_{int(global_iter):07d}.pth"
+
+    def _build_payload(
         self,
         global_iter: int,
         model: torch.nn.Module,
@@ -66,9 +69,8 @@ class CheckpointManager:
         train_stats: Optional[Dict[str, float]] = None,
         val_stats: Optional[Dict[str, float]] = None,
         extra: Optional[Dict[str, Any]] = None,
-    ) -> Path:
-        ckpt_path = self.save_dir / f"iter_{global_iter:07d}.pth"
-        payload = {
+    ) -> Dict[str, Any]:
+        return {
             "global_iter": int(global_iter),
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict() if optimizer is not None else None,
@@ -78,31 +80,92 @@ class CheckpointManager:
                 if scheduler is not None and hasattr(scheduler, "state_dict")
                 else None
             ),
-            "train_stats": train_stats or {},
-            "val_stats": val_stats or {},
-            "extra": extra or {},
+            "train_stats": dict(train_stats or {}),
+            "val_stats": dict(val_stats or {}),
+            "extra": dict(extra or {}),
         }
-        torch.save(payload, ckpt_path)
 
-        if self.cfg.save_latest:
-            latest_path = self.save_dir / "latest.pth"
-            shutil.copyfile(ckpt_path, latest_path)
+    def _save_payload(self, payload: Dict[str, Any], path: Path) -> Path:
+        torch.save(payload, path)
+        return path
 
-        if self.cfg.save_best:
-            score_source = val_stats if val_stats else (train_stats or {})
-            if self.cfg.monitor in score_source:
-                score = float(score_source[self.cfg.monitor])
-                if self._is_better(score):
-                    self.best_score = score
-                    best_path = self.save_dir / "best.pth"
-                    shutil.copyfile(ckpt_path, best_path)
-                    self.best_path = str(best_path)
-                    self._write_meta()
+    def _update_latest(self, ckpt_path: Path) -> None:
+        if not self.cfg.save_latest:
+            return
+        latest_path = self.save_dir / "latest.pth"
+        shutil.copyfile(ckpt_path, latest_path)
 
+    def _update_best_from_checkpoint(self, ckpt_path: Path, payload: Dict[str, Any]) -> None:
+        if not self.cfg.save_best:
+            return
+
+        val_stats = payload.get("val_stats", {}) or {}
+        if self.cfg.monitor not in val_stats:
+            return
+
+        score = float(val_stats[self.cfg.monitor])
+        if self._is_better(score):
+            self.best_score = score
+            best_path = self.save_dir / "best.pth"
+            shutil.copyfile(ckpt_path, best_path)
+            self.best_path = str(best_path)
+            self._write_meta()
+
+    def save_before_validation(
+        self,
+        global_iter: int,
+        model: torch.nn.Module,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        scaler: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        train_stats: Optional[Dict[str, float]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        ckpt_path = self._checkpoint_path(global_iter)
+
+        merged_extra = dict(extra or {})
+        merged_extra["val_status"] = "pending"
+
+        payload = self._build_payload(
+            global_iter=global_iter,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            scheduler=scheduler,
+            train_stats=train_stats,
+            val_stats={},
+            extra=merged_extra,
+        )
+
+        self._save_payload(payload, ckpt_path)
+        self._update_latest(ckpt_path)
         self._prune_old_checkpoints()
         return ckpt_path
 
-    def _prune_old_checkpoints(self):
+    def finalize_after_validation(
+        self,
+        ckpt_path: str | Path,
+        val_stats: Optional[Dict[str, float]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+
+        payload = torch.load(ckpt_path, map_location="cpu")
+
+        payload["val_stats"] = dict(val_stats or {})
+
+        merged_extra = dict(payload.get("extra", {}) or {})
+        merged_extra.update(dict(extra or {}))
+        merged_extra["val_status"] = "done"
+        payload["extra"] = merged_extra
+
+        self._save_payload(payload, ckpt_path)
+        self._update_best_from_checkpoint(ckpt_path, payload)
+        return ckpt_path
+
+    def _prune_old_checkpoints(self) -> None:
         ckpts = sorted(self.save_dir.glob("iter_*.pth"))
         if len(ckpts) <= self.cfg.max_keep:
             return

@@ -159,7 +159,7 @@ class LoggerHook(Hook):
 
     def after_val_iter(self, trainer, global_iter: int, step: int, batch, outputs: Dict[str, float]):
         state = getattr(trainer, "log_state", None)
-        if not state or state.get("mode") != "val_loss":
+        if not state or state.get("mode") != "val":
             return
 
         total_iters = state.get("val_total_iters", None)
@@ -203,14 +203,14 @@ class LoggerHook(Hook):
         if not val_stats:
             return
 
-        loss_msg = f"[val] iter={global_iter}"
+        metric_msg = f"[val] iter={global_iter}"
         for k, v in sorted(val_stats.items()):
             if not isinstance(v, (int, float)):
                 continue
-            if "loss" not in k.lower():
+            if "loss" in k.lower():
                 continue
-            loss_msg += f" {k}={v:.4f}"
-        print(loss_msg)
+            metric_msg += f" {k}={v:.4f}"
+        print(metric_msg)
 
         if not self.print_metric_tables:
             return

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 from collections import deque
 from dataclasses import dataclass, fields, is_dataclass
@@ -103,7 +102,7 @@ class Trainer:
 
         self._val_iter_time_history = deque(maxlen=self.cfg.log_window_size)
         self._val_data_time_history = deque(maxlen=self.cfg.log_window_size)
-        self._val_stat_history = deque(maxlen=self.cfg.log_window_size)
+        self._val_metric_history = deque(maxlen=self.cfg.log_window_size)
 
         self._train_iterator = None
         self._data_cycle = 0
@@ -286,17 +285,6 @@ class Trainer:
             outputs = inference_with_tta(self.model, batch, tta_cfg=self.cfg.tta_cfg)
         return outputs
 
-    def _compute_val_losses(self, batch) -> Dict[str, float]:
-        loss_sums, total_valid_pixels, _ = self._compute_chunk_loss_sums(
-            batch=batch,
-            do_backward=False,
-        )
-
-        return self._normalize_loss_sums(
-            loss_sums=loss_sums,
-            total_valid_pixels=total_valid_pixels,
-        )
-
     @staticmethod
     def _average_stats(stats_list: list[Dict[str, float]]) -> Dict[str, float]:
         if not stats_list:
@@ -305,7 +293,7 @@ class Trainer:
         keys = sorted({k for stats in stats_list for k in stats.keys()})
         out: Dict[str, float] = {}
         for k in keys:
-            vals = [s[k] for s in stats_list if k in s and not math.isnan(s[k])]
+            vals = [s[k] for s in stats_list if k in s]
             if vals:
                 out[k] = sum(vals) / len(vals)
         return out
@@ -441,17 +429,17 @@ class Trainer:
     def _update_val_log_state(
         self,
         val_step: int,
-        stats: Dict[str, float],
+        metric_stats_snapshot: Dict[str, float],
         data_time: float,
         iter_time: float,
     ) -> None:
         self._val_data_time_history.append(float(data_time))
         self._val_iter_time_history.append(float(iter_time))
-        self._val_stat_history.append(dict(stats))
+        self._val_metric_history.append(dict(metric_stats_snapshot))
 
         avg_data_time = self._mean_of_history(self._val_data_time_history)
         avg_iter_time = self._mean_of_history(self._val_iter_time_history)
-        avg_stats = self._average_stats(list(self._val_stat_history))
+        avg_metrics = self._average_stats(list(self._val_metric_history))
 
         eta_seconds = None
         if self.val_iters_per_epoch is not None:
@@ -459,7 +447,7 @@ class Trainer:
             eta_seconds = avg_iter_time * remaining_iters
 
         self.log_state = {
-            "mode": "val_loss",
+            "mode": "val",
             "iter": int(self.global_iter),
             "max_iters": int(self.cfg.max_iters),
             "val_iter": int(val_step),
@@ -467,7 +455,7 @@ class Trainer:
             "eta_seconds": eta_seconds,
             "iter_time": avg_iter_time,
             "data_time": avg_data_time,
-            "log_vars": avg_stats,
+            "log_vars": avg_metrics,
             "extra_log_vars": self._collect_extra_log_vars(),
         }
 
@@ -524,6 +512,37 @@ class Trainer:
             self._train_iterator = iter(self.train_dataloader)
             return next(self._train_iterator)
 
+    def _save_checkpoint_before_validation(
+        self,
+        train_stats: Dict[str, float],
+    ) -> Path:
+        return self.checkpoint_manager.save_before_validation(
+            global_iter=self.global_iter,
+            model=self.model,
+            optimizer=self.optimizer,
+            scaler=self.scaler,
+            scheduler=self.lr_scheduler,
+            train_stats=train_stats,
+            extra={
+                "monitor": self.cfg.monitor,
+                "monitor_mode": self.cfg.monitor_mode,
+            },
+        )
+
+    def _finalize_checkpoint_after_validation(
+        self,
+        ckpt_path: Path,
+        val_stats: Dict[str, float],
+    ) -> Path:
+        return self.checkpoint_manager.finalize_after_validation(
+            ckpt_path=ckpt_path,
+            val_stats=val_stats,
+            extra={
+                "monitor": self.cfg.monitor,
+                "monitor_mode": self.cfg.monitor_mode,
+            },
+        )
+
     @torch.no_grad()
     def val(self) -> Dict[str, float]:
         if self.val_dataloader is None:
@@ -535,11 +554,10 @@ class Trainer:
         self.model.eval()
         self._val_iter_time_history.clear()
         self._val_data_time_history.clear()
-        self._val_stat_history.clear()
+        self._val_metric_history.clear()
 
         eval_cfg = dict(self.cfg.eval_cfg or {})
         evaluator = MulticlassSemanticEvaluator(**eval_cfg)
-        stats_list: list[Dict[str, float]] = []
         class_names = None
 
         end = time.perf_counter()
@@ -550,8 +568,6 @@ class Trainer:
             batch = self._move_to_device(batch)
 
             outputs = self._forward_val_outputs(batch)
-            loss_stats = self._compute_val_losses(batch)
-            stats_list.append(loss_stats)
 
             targets = extract_semantic_targets_from_batch(batch)
             evaluator.update(outputs, targets)
@@ -569,48 +585,26 @@ class Trainer:
                     stage="val",
                 )
 
+            metric_snapshot = evaluator.compute()
             iter_time = time.perf_counter() - end
 
             self._update_val_log_state(
                 val_step=it,
-                stats=loss_stats,
+                metric_stats_snapshot=metric_snapshot,
                 data_time=data_time,
                 iter_time=iter_time,
             )
 
-            self.hook_manager.call("after_val_iter", self, self.global_iter, it, batch, loss_stats)
+            self.hook_manager.call("after_val_iter", self, self.global_iter, it, batch, metric_snapshot)
 
             end = time.perf_counter()
 
-        loss_stats = self._average_stats(stats_list)
-        metric_stats = evaluator.compute()
-
-        stats = {**loss_stats, **metric_stats}
+        stats = evaluator.compute()
         if class_names is not None:
             stats["_class_names"] = class_names
 
         self.hook_manager.call("after_val", self, self.global_iter, stats)
         return stats
-
-    def save_checkpoint(
-        self,
-        train_stats: Dict[str, float],
-        val_stats: Optional[Dict[str, float]] = None,
-    ) -> Path:
-        ckpt_path = self.checkpoint_manager.save(
-            global_iter=self.global_iter,
-            model=self.model,
-            optimizer=self.optimizer,
-            scaler=self.scaler,
-            scheduler=self.lr_scheduler,
-            train_stats=train_stats,
-            val_stats=val_stats or {},
-            extra={
-                "monitor": self.cfg.monitor,
-                "monitor_mode": self.cfg.monitor_mode,
-            },
-        )
-        return ckpt_path
 
     def train(self):
         if self.train_dataloader is None:
@@ -668,19 +662,35 @@ class Trainer:
 
             averaged_train_stats = self._average_stats(train_stats_window)
 
+            if should_save:
+                ckpt_path = self._save_checkpoint_before_validation(averaged_train_stats)
+                print(f"saved training-state checkpoint at iter={self.global_iter}: {ckpt_path}")
+            else:
+                ckpt_path = None
+
             if should_eval:
                 val_stats = self.val()
                 self.model.train()
             else:
                 val_stats = {}
 
-            if should_save:
-                path = self.save_checkpoint(averaged_train_stats, val_stats)
-                print(f"saved checkpoint at iter={self.global_iter}: {path}")
+            if ckpt_path is not None and should_eval:
+                self._finalize_checkpoint_after_validation(ckpt_path, val_stats)
+                print(f"finalized checkpoint with validation stats at iter={self.global_iter}: {ckpt_path}")
 
             end = time.perf_counter()
 
         final_train_stats = self._average_stats(train_stats_window)
+
+        need_final_save = (
+            self.cfg.save_interval <= 0
+            or self.global_iter % self.cfg.save_interval != 0
+        )
+
+        final_ckpt_path = None
+        if need_final_save:
+            final_ckpt_path = self._save_checkpoint_before_validation(final_train_stats)
+            print(f"saved final training-state checkpoint at iter={self.global_iter}: {final_ckpt_path}")
 
         need_final_eval = (
             self.val_dataloader is not None
@@ -689,18 +699,15 @@ class Trainer:
                 or self.global_iter % self.cfg.eval_interval != 0
             )
         )
+
         if need_final_eval:
             final_val_stats = self.val()
             self.model.train()
         else:
             final_val_stats = {}
 
-        need_final_save = (
-            self.cfg.save_interval <= 0
-            or self.global_iter % self.cfg.save_interval != 0
-        )
-        if need_final_save:
-            path = self.save_checkpoint(final_train_stats, final_val_stats)
-            print(f"saved final checkpoint at iter={self.global_iter}: {path}")
+        if final_ckpt_path is not None and need_final_eval:
+            self._finalize_checkpoint_after_validation(final_ckpt_path, final_val_stats)
+            print(f"finalized final checkpoint with validation stats at iter={self.global_iter}: {final_ckpt_path}")
 
         self.hook_manager.call("after_run", self)

@@ -47,10 +47,11 @@ class SAM3Segmentor(nn.Module):
             raw_outputs = chunk["raw_outputs"]
             chunk_class_ids = chunk["chunk_class_ids"]
 
-            adapted = self.semantic_adapter(
+            train_outputs = self.semantic_adapter(
                 raw_outputs=raw_outputs,
                 batch=batch,
                 expected_num_classes=len(chunk_class_ids),
+                output_mode="train",
             )
 
             yield {
@@ -59,15 +60,15 @@ class SAM3Segmentor(nn.Module):
                 "chunk_class_ids": chunk_class_ids,
                 "chunk_class_names": chunk["chunk_class_names"],
                 "raw_outputs": raw_outputs,
-                "train_outputs": adapted["train_outputs"],
-                "inference_outputs": adapted["inference_outputs"],
+                "train_outputs": train_outputs,
             }
 
     def forward(self, batch: BatchedDatapoint) -> dict[str, torch.Tensor]:
         raw_outputs = self.core(batch)
-        adapted = self.semantic_adapter(
+        inference_outputs = self.semantic_adapter(
             raw_outputs=raw_outputs,
             batch=batch,
             expected_num_classes=None,
+            output_mode="infer",
         )
-        return adapted["inference_outputs"]
+        return inference_outputs

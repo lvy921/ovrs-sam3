@@ -3,7 +3,7 @@ _base_ = [
     "./_base_/optimizer.py",
     "./_base_/schedule.py",
     "./_base_/visualization.py",
-    "./datasets/loveda.py",
+    "./datasets/isaid.py",
 ]
 
 model = dict(
@@ -31,8 +31,8 @@ model = dict(
             "a remote sensing image of {}.",
             "an aerial image of {}.",
         ],
-        num_extra_tokens=2,
-        text_token_gate_init=1.0,
+        num_extra_tokens=0,
+        text_token_gate_init=0.2,
         normalize_label_for_clip=True,
     ),
 
@@ -53,6 +53,11 @@ model = dict(
 
 train_dataloader = dict(
     batch_size=2,
+    num_workers=8,
+)
+
+val_dataloader = dict(
+    batch_size=4,
     num_workers=8,
 )
 
@@ -109,10 +114,10 @@ tta_cfg = dict(
 )
 
 criterion = dict(
-    semantic_bce=1.0,
+    semantic_bce=0.2,
     semantic_dice=1.0,
-    instance_bce=1.0,
+    instance_bce=0.2,
     instance_dice=1.0,
-    presence_bce=0.25,
+    presence_bce=1.0,
     ignore_index=255,
 )

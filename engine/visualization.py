@@ -10,8 +10,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from ..models.geometry_encoders import Prompt
-
 
 @dataclass
 class VisualizerConfig:
@@ -73,6 +71,8 @@ class BaseSemanticOverlayTask(VisualizationTask):
 
         gt = semantic_targets["label_map"]
         if gt.dim() == 4:
+            if gt.shape[1] != 1:
+                raise ValueError(f"Expected gt as [B,1,H,W] or [B,H,W], got {tuple(gt.shape)}")
             gt = gt[:, 0]
 
         pred_num_classes = int(fused_score_map.shape[1])
@@ -138,185 +138,6 @@ class BaseSemanticOverlayTask(VisualizationTask):
                         f.write(f"{i}\t{name}\n")
 
 
-class EncoderLayerSemanticProbeTask(VisualizationTask):
-    name = "encoder_layer_semantic_probe"
-
-    @staticmethod
-    def _semantic_score_from_encoder_hidden(
-        seg_head,
-        backbone_feats,
-        image_ids,
-        prompt,
-        prompt_mask,
-        encoder_hidden_states,
-    ):
-        if seg_head.cross_attend_prompt is not None:
-            tgt2 = seg_head.cross_attn_norm(encoder_hidden_states)
-            tgt2 = seg_head.cross_attend_prompt(
-                query=tgt2,
-                key=prompt,
-                value=prompt,
-                key_padding_mask=prompt_mask,
-            )[0]
-            encoder_hidden_states = tgt2 + encoder_hidden_states
-
-        pixel_embed = seg_head._embed_pixels(
-            backbone_feats=backbone_feats,
-            image_ids=image_ids,
-            encoder_hidden_states=encoder_hidden_states,
-        )
-
-        semantic_seg = seg_head.semantic_seg_head(pixel_embed)  # [N_pair,1,H,W]
-        return semantic_seg
-
-    def _collect_layer_semantic_score_maps(self, core, batch):
-        device = core.device
-        if len(batch.find_inputs) != 1:
-            raise ValueError("Current semantic-only pipeline assumes exactly one find stage per batch.")
-
-        base_find_input = batch.find_inputs[0]
-        class_texts = list(batch.find_text_batch)
-        batch_size = int(batch.img_batch.shape[0])
-        num_classes = len(class_texts)
-        chunk_size = core._get_prompt_chunk_size(num_classes)
-
-        image_backbone_out = core.backbone.forward_image(batch.img_batch)
-
-        per_layer_chunk_outputs = None
-
-        for start in range(0, num_classes, chunk_size):
-            end = min(start + chunk_size, num_classes)
-            chunk_texts = class_texts[start:end]
-            num_chunk_classes = len(chunk_texts)
-
-            text_backbone_out = core.backbone.forward_text(chunk_texts, device=device)
-
-            chunk_backbone_out = dict(image_backbone_out)
-            chunk_backbone_out.update(text_backbone_out)
-
-            if hasattr(core, "_build_clip_extra_text_tokens"):
-                clip_extra_tokens = core._build_clip_extra_text_tokens(chunk_texts, device=device)
-                if clip_extra_tokens is not None:
-                    chunk_backbone_out["clip_language_features"] = clip_extra_tokens
-                    chunk_backbone_out["clip_language_mask"] = torch.zeros(
-                        (num_chunk_classes, clip_extra_tokens.shape[0]),
-                        dtype=torch.bool,
-                        device=device,
-                    )
-
-            chunk_find_input = core._build_prompt_expanded_find_stage(
-                batch_size=batch_size,
-                num_chunk_classes=num_chunk_classes,
-                device=device,
-                base_find_input=base_find_input,
-            )
-
-            geometric_prompt = Prompt(
-                box_embeddings=chunk_find_input.input_boxes,
-                box_mask=chunk_find_input.input_boxes_mask,
-                box_labels=chunk_find_input.input_boxes_label,
-            )
-
-            prompt, prompt_mask, chunk_backbone_out = core._encode_prompt(
-                chunk_backbone_out, chunk_find_input, geometric_prompt
-            )
-
-            captured_layer_outputs = []
-
-            def _make_hook():
-                def _hook(module, inputs, output):
-                    captured_layer_outputs.append(output.detach())
-                return _hook
-
-            handles = [
-                layer.register_forward_hook(_make_hook())
-                for layer in core.transformer.encoder.layers
-            ]
-
-            try:
-                _, encoder_out, _ = core._run_encoder(
-                    chunk_backbone_out,
-                    chunk_find_input,
-                    prompt,
-                    prompt_mask,
-                )
-            finally:
-                for h in handles:
-                    h.remove()
-
-            if per_layer_chunk_outputs is None:
-                per_layer_chunk_outputs = [[] for _ in range(len(captured_layer_outputs))]
-
-            for layer_idx, layer_out in enumerate(captured_layer_outputs):
-                encoder_hidden_states = layer_out.transpose(0, 1).contiguous()
-
-                semantic_seg = self._semantic_score_from_encoder_hidden(
-                    seg_head=core.segmentation_head,
-                    backbone_feats=chunk_backbone_out["backbone_fpn"],
-                    image_ids=chunk_find_input.img_ids,
-                    prompt=prompt,
-                    prompt_mask=prompt_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                )
-
-                semantic_seg = core._reshape_prompt_first_tensor(
-                    semantic_seg,
-                    batch_size=batch_size,
-                    num_chunk_classes=num_chunk_classes,
-                    key=f"layer_{layer_idx}_semantic_seg",
-                )  # [B,C_chunk,1,H,W]
-
-                per_layer_chunk_outputs[layer_idx].append({"semantic_seg": semantic_seg})
-
-        layer_score_maps = []
-        for _, chunk_outputs in enumerate(per_layer_chunk_outputs):
-            merged = core._merge_chunk_outputs(chunk_outputs)
-            semantic_seg = merged["semantic_seg"]  # [B,C,1,H,W]
-            semantic_score_map = semantic_seg[:, :, 0].sigmoid()  # [B,C,H,W]
-            layer_score_maps.append(semantic_score_map)
-
-        return layer_score_maps
-
-    def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
-        if len(ctx.selected_indices) == 0:
-            return
-
-        model = ctx.model
-        core = getattr(model, "core", None)
-        if core is None:
-            return
-
-        seg_head = getattr(core, "segmentation_head", None)
-        if seg_head is None:
-            return
-
-        with torch.no_grad():
-            layer_score_maps = self._collect_layer_semantic_score_maps(core, ctx.batch)
-
-        num_classes = int(layer_score_maps[0].shape[1])
-
-        for layer_idx, score_map in enumerate(layer_score_maps):
-            pred = score_map.argmax(dim=1)
-
-            for b in ctx.selected_indices:
-                image_id = manager._extract_image_id(ctx.batch, b)
-                sample_dir = manager._resolve_sample_dir(
-                    image_id=image_id,
-                    epoch=ctx.epoch,
-                    stage=ctx.stage,
-                )
-                overlay_image = manager._extract_overlay_image(ctx.batch, b)
-                out_hw = overlay_image.size[::-1]
-
-                pred_label = manager._prepare_label_map(pred[b], out_hw)
-
-                manager._overlay_label_map(
-                    overlay_image,
-                    pred_label,
-                    num_classes,
-                ).save(sample_dir / f"encoder_layer_{layer_idx:02d}_semantic_overlay.png")
-
-
 class VisualizationManager:
     def __init__(self, cfg: VisualizerConfig):
         self.cfg = cfg
@@ -328,7 +149,6 @@ class VisualizationManager:
     def _build_tasks(self):
         return [
             BaseSemanticOverlayTask(),
-            EncoderLayerSemanticProbeTask(),
         ]
 
     @classmethod

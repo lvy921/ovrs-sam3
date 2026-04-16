@@ -332,12 +332,12 @@ class SemanticCriterion(nn.Module):
                 valid_mask=valid_mask,
             )
 
-            loss_semantic_bce = self._scale_loss_for_reduction(
+            loss_semantic_bce = self.weights.semantic_bce * self._scale_loss_for_reduction(
                 base_loss=semantic_bce_base,
                 num_valid_pixels=num_valid_pixels,
                 reduction=reduction,
             )
-            loss_semantic_dice = self._scale_loss_for_reduction(
+            loss_semantic_dice = self.weights.semantic_dice * self._scale_loss_for_reduction(
                 base_loss=semantic_dice_base,
                 num_valid_pixels=num_valid_pixels,
                 reduction=reduction,
@@ -359,12 +359,12 @@ class SemanticCriterion(nn.Module):
                 valid_mask=valid_mask,
             )
 
-            loss_instance_bce = self._scale_loss_for_reduction(
+            loss_instance_bce = self.weights.instance_bce * self._scale_loss_for_reduction(
                 base_loss=instance_bce_base,
                 num_valid_pixels=num_valid_pixels,
                 reduction=reduction,
             )
-            loss_instance_dice = self._scale_loss_for_reduction(
+            loss_instance_dice = self.weights.instance_dice * self._scale_loss_for_reduction(
                 base_loss=instance_dice_base,
                 num_valid_pixels=num_valid_pixels,
                 reduction=reduction,
@@ -389,7 +389,7 @@ class SemanticCriterion(nn.Module):
                 presence_logits=presence_logits,
                 presence_targets=presence_targets,
             )
-            loss_presence_bce = self._scale_loss_for_reduction(
+            loss_presence_bce = self.weights.presence_bce * self._scale_loss_for_reduction(
                 base_loss=presence_bce_base,
                 num_valid_pixels=num_valid_pixels,
                 reduction=reduction,
@@ -399,11 +399,11 @@ class SemanticCriterion(nn.Module):
             loss_presence_bce = ref.sum() * 0.0
 
         total_loss = (
-            self.weights.semantic_bce * loss_semantic_bce
-            + self.weights.semantic_dice * loss_semantic_dice
-            + self.weights.instance_bce * loss_instance_bce
-            + self.weights.instance_dice * loss_instance_dice
-            + self.weights.presence_bce * loss_presence_bce
+            loss_semantic_bce
+            + loss_semantic_dice
+            + loss_instance_bce
+            + loss_instance_dice
+            + loss_presence_bce
         )
 
         return {
