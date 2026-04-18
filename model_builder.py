@@ -1,7 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
-
-# pyre-unsafe
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -106,6 +102,13 @@ class OpenCLIPConfig:
     num_extra_tokens: int = 2
     text_token_gate_init: float = 0.0
     normalize_label_for_clip: bool = True
+
+    # ------------------------------------------------------------------
+    # New CLIP presence-score config
+    # ------------------------------------------------------------------
+    presence_topk: int = 8
+    presence_sim_temperature: float = 30.0
+    presence_score_temperature: float = 20.0
 
 
 @dataclass
@@ -411,12 +414,27 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         if openclip_cfg.enabled:
             _ = cls._resolve_openclip_pretrained(openclip_cfg.pretrained)
 
+        if int(openclip_cfg.presence_topk) <= 0:
+            raise ValueError(
+                f"openclip_cfg.presence_topk must be > 0, got {openclip_cfg.presence_topk}"
+            )
+        if float(openclip_cfg.presence_sim_temperature) <= 0:
+            raise ValueError(
+                "openclip_cfg.presence_sim_temperature must be > 0, "
+                f"got {openclip_cfg.presence_sim_temperature}"
+            )
+        if float(openclip_cfg.presence_score_temperature) <= 0:
+            raise ValueError(
+                "openclip_cfg.presence_score_temperature must be > 0, "
+                f"got {openclip_cfg.presence_score_temperature}"
+            )
+
         return openclip_cfg
 
     @classmethod
     def _create_openclip_encoders(
-        cls,
-        openclip_cfg: OpenCLIPConfig,
+            cls,
+            openclip_cfg: OpenCLIPConfig,
     ) -> tuple[OpenCLIPTextEncoder, OpenCLIPImageEncoder]:
         import open_clip
 
@@ -455,7 +473,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
         image_encoder = OpenCLIPImageEncoder(
             visual=clip_model.visual,
-            default_output=openclip_cfg.default_output,
+            default_output='all',
         )
 
         return text_encoder, image_encoder
