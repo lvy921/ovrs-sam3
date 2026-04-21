@@ -3,7 +3,7 @@ _base_ = [
     "./_base_/optimizer.py",
     "./_base_/schedule.py",
     "./_base_/visualization.py",
-    "./datasets/vaihingen.py",
+    "./datasets/isaid.py",
 ]
 
 model = dict(
@@ -34,8 +34,9 @@ model = dict(
         train_adapters_only=True,
         trainable_modules=[
             "core.clip_text_proj",
-            "core.clip_text_token_gate",
             "core.clip_image_proj",
+            "core.clip_dynamic_gate",
+            "core.clip_token_global_scale",
             "core.clip_text_to_image_attn",
             "core.clip_text_to_image_norm",
             "core.clip_to_sam3_text_attn",

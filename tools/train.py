@@ -86,11 +86,10 @@ def build_log_getters(cfg) -> List[object]:
         if core is None:
             return out
 
-        if hasattr(core, "clip_text_token_gate"):
-            gate = core.clip_text_token_gate.detach()
+        if hasattr(core, "clip_token_global_scale"):
+            gate = core.clip_token_global_scale.detach()
             if gate.numel() == 1:
-                out["clip_gate_raw"] = float(gate.item())
-                out["clip_gate_tanh"] = float(torch.tanh(gate).item())
+                out["clip_token_global_scale"] = float(gate.item())
 
         return out
 

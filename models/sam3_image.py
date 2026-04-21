@@ -80,9 +80,13 @@ class Sam3Image(torch.nn.Module):
             )
 
         self.clip_text_token_norm = nn.LayerNorm(self.hidden_dim)
-        self.clip_text_token_gate = nn.Parameter(
-            torch.tensor(float(getattr(openclip_cfg, "text_token_gate_init", 0.0)))
-        )
+        self.clip_image_token_norm = nn.LayerNorm(self.hidden_dim)
+
+        self.clip_dynamic_gate = nn.Linear(self.hidden_dim * 2, 1)
+        nn.init.zeros_(self.clip_dynamic_gate.weight)
+        nn.init.zeros_(self.clip_dynamic_gate.bias)
+
+        self.clip_token_global_scale = nn.Parameter(torch.tensor(0.3, dtype=torch.float32))
 
         self.register_buffer(
             "openclip_image_mean",
@@ -654,6 +658,100 @@ class Sam3Image(torch.nn.Module):
 
         return aligned, clip_pair_mask
 
+    @staticmethod
+    def _masked_mean_pool(
+        x: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, D]
+            mask: [B, T], True 表示 padding / invalid
+        Returns:
+            pooled: [B, D]
+        """
+        if x.ndim != 3:
+            raise ValueError(f"Expected x as [B, T, D], got {tuple(x.shape)}")
+        if mask.ndim != 2:
+            raise ValueError(f"Expected mask as [B, T], got {tuple(mask.shape)}")
+        if x.shape[:2] != mask.shape:
+            raise ValueError(
+                f"Shape mismatch between x and mask: x.shape[:2]={x.shape[:2]}, "
+                f"mask.shape={mask.shape}"
+            )
+
+        valid = (~mask).to(dtype=x.dtype).unsqueeze(-1)  # [B, T, 1]
+        denom = valid.sum(dim=1).clamp_min(1.0)          # [B, 1]
+        pooled = (x * valid).sum(dim=1) / denom
+        return pooled
+
+    def _apply_clip_dynamic_gate(
+        self,
+        clip_pair_tokens: torch.Tensor,
+        clip_pair_mask: torch.Tensor,
+        sam3_pair_text_feats: torch.Tensor,
+        sam3_pair_text_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            clip_pair_tokens: [K, B*C, D]
+            clip_pair_mask: [B*C, K]
+            sam3_pair_text_feats: [B*C, L, D]
+            sam3_pair_text_mask: [B*C, L]
+        Returns:
+            gated_clip_pair_tokens: [K, B*C, D]
+        """
+        if clip_pair_tokens.ndim != 3:
+            raise ValueError(
+                f"Expected clip_pair_tokens as [K, B*C, D], got {tuple(clip_pair_tokens.shape)}"
+            )
+        if clip_pair_mask.ndim != 2:
+            raise ValueError(
+                f"Expected clip_pair_mask as [B*C, K], got {tuple(clip_pair_mask.shape)}"
+            )
+        if sam3_pair_text_feats.ndim != 3:
+            raise ValueError(
+                f"Expected sam3_pair_text_feats as [B*C, L, D], got {tuple(sam3_pair_text_feats.shape)}"
+            )
+        if sam3_pair_text_mask.ndim != 2:
+            raise ValueError(
+                f"Expected sam3_pair_text_mask as [B*C, L], got {tuple(sam3_pair_text_mask.shape)}"
+            )
+
+        num_clip_tokens, num_pairs, dim = clip_pair_tokens.shape
+        if clip_pair_mask.shape != (num_pairs, num_clip_tokens):
+            raise ValueError(
+                f"clip_pair_mask shape mismatch: expected {(num_pairs, num_clip_tokens)}, "
+                f"got {tuple(clip_pair_mask.shape)}"
+            )
+        if sam3_pair_text_feats.shape[0] != num_pairs:
+            raise ValueError(
+                f"sam3_pair_text_feats first dim mismatch: expected {num_pairs}, "
+                f"got {sam3_pair_text_feats.shape[0]}"
+            )
+        if sam3_pair_text_feats.shape[2] != dim:
+            raise ValueError(
+                f"Feature dim mismatch: clip_pair_tokens dim={dim}, "
+                f"sam3_pair_text_feats dim={sam3_pair_text_feats.shape[2]}"
+            )
+        if sam3_pair_text_mask.shape[0] != num_pairs:
+            raise ValueError(
+                f"sam3_pair_text_mask first dim mismatch: expected {num_pairs}, "
+                f"got {sam3_pair_text_mask.shape[0]}"
+            )
+
+        clip_feats = clip_pair_tokens.transpose(0, 1).contiguous()  # [B*C, K, D]
+        clip_summary = self._masked_mean_pool(clip_feats, clip_pair_mask)  # [B*C, D]
+        sam3_summary = self._masked_mean_pool(sam3_pair_text_feats, sam3_pair_text_mask)  # [B*C, D]
+
+        gate_input = torch.cat([clip_summary, sam3_summary], dim=-1)  # [B*C, 2D]
+        dynamic_gate = torch.sigmoid(self.clip_dynamic_gate(gate_input))  # [B*C, 1]
+
+        scale = self.clip_token_global_scale * dynamic_gate  # [B*C, 1]
+        clip_feats = clip_feats * scale.unsqueeze(-1)        # [B*C, K, D]
+
+        return clip_feats.transpose(0, 1).contiguous()       # [K, B*C, D]
+
     def iter_chunk_raw_outputs(
         self,
         input: BatchedDatapoint,
@@ -713,9 +811,6 @@ class Sam3Image(torch.nn.Module):
                 )  # [C, K, 256]
                 clip_text_tokens = self.clip_text_token_norm(clip_text_tokens)
 
-                text_gate = torch.tanh(self.clip_text_token_gate)
-                clip_text_tokens = text_gate * clip_text_tokens
-
                 if clip_image_cache is not None:
                     if self.clip_image_proj is None:
                         raise RuntimeError(
@@ -724,7 +819,9 @@ class Sam3Image(torch.nn.Module):
 
                     clip_image_tokens = self.clip_image_proj(
                         clip_image_cache["clip_image_tokens_native"]
-                    ).contiguous()  # [B, N, 256]
+                    )
+                    clip_image_tokens = self.clip_image_token_norm(clip_image_tokens)
+                    clip_image_tokens = clip_image_tokens.contiguous()  # [B, N, 256]
 
                     pair_tokens, pair_mask = self._fuse_clip_text_tokens_with_image(
                         clip_text_tokens=clip_text_tokens,
@@ -745,6 +842,13 @@ class Sam3Image(torch.nn.Module):
                 )
 
                 pair_tokens, pair_mask = self._align_clip_pair_tokens_with_sam3_text(
+                    clip_pair_tokens=pair_tokens,
+                    clip_pair_mask=pair_mask,
+                    sam3_pair_text_feats=sam3_pair_feats,
+                    sam3_pair_text_mask=sam3_pair_mask,
+                )
+
+                pair_tokens = self._apply_clip_dynamic_gate(
                     clip_pair_tokens=pair_tokens,
                     clip_pair_mask=pair_mask,
                     sam3_pair_text_feats=sam3_pair_feats,
