@@ -5,7 +5,7 @@ visualization = dict(
     alpha=0.45,
 
     vis_prob=0.05,
-    max_samples_per_epoch=100,
+    max_samples_per_epoch=0,
     vis_seed=42,
 
     image_folder_pattern='image_{image_id:06d}',

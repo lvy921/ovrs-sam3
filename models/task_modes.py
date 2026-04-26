@@ -22,6 +22,10 @@ class ModelOutputKeys:
     final_score_map: str = "final_score_map"
     final_pred: str = "final_pred"
 
+    encoder_aux_outputs: str = "encoder_aux_outputs"
+    encoder_aux_layer_id: str = "layer_id"
+    encoder_aux_semantic_logits: str = "semantic_logits"
+
 
 OUTPUT_KEYS = ModelOutputKeys()
 
