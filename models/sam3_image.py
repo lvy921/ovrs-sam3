@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from .vl_combiner import SAM3VLBackbone
 from .data_misc import BatchedDatapoint, FindStage
 from .geometry_encoders import Prompt
-from .task_modes import TASK_MODE_SEMANTIC, normalize_task_mode, OUTPUT_KEYS
+from .task_modes import TASK_MODE_SEMANTIC, normalize_task_mode
 
 class ClipSamImageFusionEncoder(nn.Module):
     """
@@ -707,8 +707,8 @@ class Sam3Image(torch.nn.Module):
 
             aux_outputs.append(
                 {
-                    OUTPUT_KEYS.encoder_aux_layer_id: layer_id,
-                    OUTPUT_KEYS.encoder_aux_semantic_logits: chunk_logits,
+                    "layer_id": layer_id,
+                    "semantic_logits": chunk_logits,
                 }
             )
 
@@ -1878,18 +1878,17 @@ class Sam3Image(torch.nn.Module):
         return x.reshape(batch_size, num_chunk_classes, *x.shape[1:])
 
     def _extract_and_reshape_chunk_outputs(
-            self,
-            raw_outputs: Dict[str, torch.Tensor],
-            batch_size: int,
-            num_chunk_classes: int,
+        self,
+        raw_outputs: Dict[str, torch.Tensor],
+        batch_size: int,
+        num_chunk_classes: int,
     ) -> Dict[str, torch.Tensor]:
         keep_keys = [
-            OUTPUT_KEYS.semantic_logits,
-            OUTPUT_KEYS.presence_logits,
+            "semantic_logits",
+            "presence_logits",
         ]
 
         out = {}
-
         for key in keep_keys:
             if key in raw_outputs and raw_outputs[key] is not None:
                 out[key] = self._reshape_prompt_first_tensor(
@@ -1898,81 +1897,6 @@ class Sam3Image(torch.nn.Module):
                     num_chunk_classes=num_chunk_classes,
                     key=key,
                 )
-
-        encoder_aux_outputs = raw_outputs.get(OUTPUT_KEYS.encoder_aux_outputs, None)
-        if encoder_aux_outputs is not None:
-            if not isinstance(encoder_aux_outputs, list):
-                raise TypeError(
-                    f"Expected raw_outputs[{OUTPUT_KEYS.encoder_aux_outputs!r}] "
-                    f"to be a list, got {type(encoder_aux_outputs)}."
-                )
-
-            checked_aux_outputs = []
-
-            for index, item in enumerate(encoder_aux_outputs):
-                if not isinstance(item, dict):
-                    raise TypeError(
-                        f"Expected encoder aux output item to be a dict, "
-                        f"got index={index}, type={type(item)}."
-                    )
-
-                if OUTPUT_KEYS.encoder_aux_layer_id not in item:
-                    raise KeyError(
-                        f"encoder_aux_outputs[{index}] is missing "
-                        f"{OUTPUT_KEYS.encoder_aux_layer_id!r}."
-                    )
-
-                if OUTPUT_KEYS.encoder_aux_semantic_logits not in item:
-                    raise KeyError(
-                        f"encoder_aux_outputs[{index}] is missing "
-                        f"{OUTPUT_KEYS.encoder_aux_semantic_logits!r}."
-                    )
-
-                layer_id = int(item[OUTPUT_KEYS.encoder_aux_layer_id])
-                aux_logits = item[OUTPUT_KEYS.encoder_aux_semantic_logits]
-
-                if not torch.is_tensor(aux_logits):
-                    raise TypeError(
-                        f"Expected encoder aux semantic logits at layer {layer_id} "
-                        f"to be a tensor, got {type(aux_logits)}."
-                    )
-
-                if aux_logits.dim() == 5:
-                    if aux_logits.shape[2] != 1:
-                        raise ValueError(
-                            f"Expected encoder aux semantic logits at layer {layer_id} "
-                            f"as [B, C, 1, H, W], got {tuple(aux_logits.shape)}."
-                        )
-                    aux_logits = aux_logits[:, :, 0]
-
-                if aux_logits.dim() != 4:
-                    raise ValueError(
-                        f"Expected encoder aux semantic logits at layer {layer_id} "
-                        f"as [B, C, H, W], got {tuple(aux_logits.shape)}."
-                    )
-
-                if int(aux_logits.shape[0]) != int(batch_size):
-                    raise ValueError(
-                        f"Batch size mismatch for encoder aux layer {layer_id}: "
-                        f"expected {batch_size}, got {int(aux_logits.shape[0])}."
-                    )
-
-                if int(aux_logits.shape[1]) != int(num_chunk_classes):
-                    raise ValueError(
-                        f"Class count mismatch for encoder aux layer {layer_id}: "
-                        f"expected {num_chunk_classes}, got {int(aux_logits.shape[1])}."
-                    )
-
-                checked_aux_outputs.append(
-                    {
-                        OUTPUT_KEYS.encoder_aux_layer_id: layer_id,
-                        OUTPUT_KEYS.encoder_aux_semantic_logits: aux_logits.contiguous(),
-                    }
-                )
-
-            if len(checked_aux_outputs) > 0:
-                out[OUTPUT_KEYS.encoder_aux_outputs] = checked_aux_outputs
-
         return out
 
     @staticmethod
@@ -2181,7 +2105,7 @@ class Sam3Image(torch.nn.Module):
         )
 
         if len(encoder_aux_outputs) > 0:
-            out[OUTPUT_KEYS.encoder_aux_outputs] = encoder_aux_outputs
+            out["encoder_aux_outputs"] = encoder_aux_outputs
 
         with torch.profiler.record_function("Sam3Image._run_presence_head"):
             presence_logits = self._run_presence_head(

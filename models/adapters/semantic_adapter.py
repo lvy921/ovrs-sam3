@@ -95,18 +95,18 @@ class SemanticSegAdapter(nn.Module):
                     f"got index={index}, type={type(item)}."
                 )
 
-            if OUTPUT_KEYS.encoder_aux_layer_id not in item:
+            if "layer_id" not in item:
                 raise KeyError(
                     f"encoder_aux_outputs[{index}] is missing key 'layer_id'."
                 )
 
-            if OUTPUT_KEYS.encoder_aux_semantic_logits not in item:
+            if "semantic_logits" not in item:
                 raise KeyError(
                     f"encoder_aux_outputs[{index}] is missing key 'semantic_logits'."
                 )
 
-            layer_id = int(item[OUTPUT_KEYS.encoder_aux_layer_id])
-            aux_logits = item[OUTPUT_KEYS.encoder_aux_semantic_logits]
+            layer_id = int(item["layer_id"])
+            aux_logits = item["semantic_logits"]
 
             if not torch.is_tensor(aux_logits):
                 raise TypeError(
@@ -134,8 +134,8 @@ class SemanticSegAdapter(nn.Module):
 
             checked_outputs.append(
                 {
-                    OUTPUT_KEYS.encoder_aux_layer_id: layer_id,
-                    OUTPUT_KEYS.encoder_aux_semantic_logits: aux_logits,
+                    "layer_id": layer_id,
+                    "semantic_logits": aux_logits,
                 }
             )
 

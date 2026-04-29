@@ -101,7 +101,7 @@ class SemanticCriterion(nn.Module):
 			outputs: Dict[str, torch.Tensor],
 			reference_logits: torch.Tensor,
 	) -> list[Dict[str, torch.Tensor]]:
-		aux_outputs = outputs.get(OUTPUT_KEYS.encoder_aux_outputs, None)
+		aux_outputs = outputs.get("encoder_aux_outputs", None)
 		if aux_outputs is None:
 			return []
 
@@ -122,20 +122,16 @@ class SemanticCriterion(nn.Module):
 					f"encoder_aux_outputs[{index}] must be a dict, got {type(item)}."
 				)
 
-			if OUTPUT_KEYS.encoder_aux_layer_id not in item:
+			if "layer_id" not in item:
+				raise KeyError(f"encoder_aux_outputs[{index}] is missing 'layer_id'.")
+
+			if "semantic_logits" not in item:
 				raise KeyError(
-					f"encoder_aux_outputs[{index}] is missing "
-					f"{OUTPUT_KEYS.encoder_aux_layer_id!r}."
+					f"encoder_aux_outputs[{index}] is missing 'semantic_logits'."
 				)
 
-			if OUTPUT_KEYS.encoder_aux_semantic_logits not in item:
-				raise KeyError(
-					f"encoder_aux_outputs[{index}] is missing "
-					f"{OUTPUT_KEYS.encoder_aux_semantic_logits!r}."
-				)
-
-			layer_id = int(item[OUTPUT_KEYS.encoder_aux_layer_id])
-			aux_logits = item[OUTPUT_KEYS.encoder_aux_semantic_logits]
+			layer_id = int(item["layer_id"])
+			aux_logits = item["semantic_logits"]
 
 			if not torch.is_tensor(aux_logits):
 				raise TypeError(
@@ -163,8 +159,8 @@ class SemanticCriterion(nn.Module):
 
 			checked.append(
 				{
-					OUTPUT_KEYS.encoder_aux_layer_id: layer_id,
-					OUTPUT_KEYS.encoder_aux_semantic_logits: aux_logits,
+					"layer_id": layer_id,
+					"semantic_logits": aux_logits,
 				}
 			)
 
@@ -199,8 +195,8 @@ class SemanticCriterion(nn.Module):
 		log_vars: Dict[str, torch.Tensor] = {}
 
 		for item in aux_outputs:
-			layer_id = int(item[OUTPUT_KEYS.encoder_aux_layer_id])
-			aux_logits = item[OUTPUT_KEYS.encoder_aux_semantic_logits]
+			layer_id = int(item["layer_id"])
+			aux_logits = item["semantic_logits"]
 
 			aux_label_map = self._resize_label_map_to_logits(
 				label_map=original_label_map,
