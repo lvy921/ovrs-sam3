@@ -197,12 +197,19 @@ class SemanticSegAdapter(nn.Module):
             presence_logits=presence_logits,
         )
 
-        return {
+        train_outputs = {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
             OUTPUT_KEYS.presence_logits: presence_logits,
             OUTPUT_KEYS.presence_score: presence_score,
             OUTPUT_KEYS.final_logits: final_logits,
         }
+
+        if OUTPUT_KEYS.extra_token_aux_logits in raw_outputs:
+            train_outputs[OUTPUT_KEYS.extra_token_aux_logits] = raw_outputs[
+                OUTPUT_KEYS.extra_token_aux_logits
+            ]
+
+        return train_outputs
 
     def _build_inference_outputs(
         self,

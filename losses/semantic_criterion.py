@@ -21,6 +21,14 @@ class SemanticCriterionConfig:
 	final_dice_weight: float = 0.5
 	final_ce_weight: float = 1.0
 
+	extra_token_aux_loss_weight: float = 0.1
+	extra_token_aux_bce_weight: float = 0.03
+	extra_token_aux_dice_weight: float = 0.03
+	extra_token_aux_absent_weight: float = 0.01
+	extra_token_aux_absent_topk_ratio: float = 0.05
+	extra_token_aux_exclude_bg: bool = True
+	extra_token_aux_bg_idx: int = 0
+
 	eps: float = 1e-6
 
 	bce_class_balance_clamp_min: float = 0.2
@@ -85,6 +93,21 @@ class SemanticCriterion(nn.Module):
 		elif logits.dim() != 2:
 			raise ValueError(
 				f"Expected presence_logits as [B, C] or [B, C, 1], got {tuple(logits.shape)}"
+			)
+
+		return logits
+
+	def _extract_extra_token_aux_logits(
+		self,
+		outputs: Dict[str, torch.Tensor],
+	) -> Optional[torch.Tensor]:
+		if OUTPUT_KEYS.extra_token_aux_logits not in outputs:
+			return None
+
+		logits = outputs[OUTPUT_KEYS.extra_token_aux_logits]
+		if logits.dim() != 4:
+			raise ValueError(
+				f"Expected extra_token_aux_logits as [B, C, H, W], got {tuple(logits.shape)}"
 			)
 
 		return logits
@@ -209,6 +232,38 @@ class SemanticCriterion(nn.Module):
 				f"Expected present_pair_mask as [B, C], got {tuple(present_pair_mask.shape)}"
 			)
 		return present_pair_mask.to(torch.float32)
+
+	def _build_extra_token_absent_pair_mask(
+		self,
+		present_pair_mask: torch.Tensor,
+		chunk_class_ids: Sequence[int],
+	) -> torch.Tensor:
+		if present_pair_mask.dim() != 2:
+			raise ValueError(
+				f"Expected present_pair_mask as [B, C], got {tuple(present_pair_mask.shape)}"
+			)
+
+		num_channels = int(present_pair_mask.shape[1])
+		if len(chunk_class_ids) != num_channels:
+			raise ValueError(
+				f"chunk_class_ids length mismatch: expected {num_channels}, got {len(chunk_class_ids)}"
+			)
+
+		absent_pair_mask = ~present_pair_mask
+
+		if bool(self.cfg.extra_token_aux_exclude_bg):
+			bg_idx = int(self.cfg.extra_token_aux_bg_idx)
+			bg_channels = [
+				local_idx
+				for local_idx, global_class_id in enumerate(chunk_class_ids)
+				if int(global_class_id) == bg_idx
+			]
+			if len(bg_channels) > 0:
+				absent_pair_mask = absent_pair_mask.clone()
+				for local_idx in bg_channels:
+					absent_pair_mask[:, local_idx] = False
+
+		return absent_pair_mask
 
 	def _build_dynamic_class_weights(
 		self,
@@ -428,6 +483,116 @@ class SemanticCriterion(nn.Module):
 			reduction="mean",
 		)
 		return loss_final_ce, num_ce_valid
+
+	def _extra_token_aux_loss(
+		self,
+		extra_logits: Optional[torch.Tensor],
+		label_map: torch.Tensor,
+		chunk_class_ids: Sequence[int],
+	) -> Dict[str, torch.Tensor]:
+		ref_tensor = label_map
+		if extra_logits is not None:
+			ref_tensor = extra_logits
+
+		zero = ref_tensor.sum() * 0.0
+
+		if extra_logits is None:
+			return {
+				"loss_extra_token_aux_bce": zero,
+				"loss_extra_token_aux_dice": zero,
+				"loss_extra_token_aux_absent": zero,
+				"loss_extra_token_aux": zero,
+			}
+
+		if extra_logits.dim() != 4:
+			raise ValueError(
+				f"Expected extra_logits as [B, C, H, W], got {tuple(extra_logits.shape)}"
+			)
+
+		num_channels = int(extra_logits.shape[1])
+		if chunk_class_ids is None:
+			raise ValueError(
+				"extra token auxiliary loss requires chunk_class_ids."
+			)
+		if len(chunk_class_ids) != num_channels:
+			raise ValueError(
+				f"chunk_class_ids length mismatch for extra token auxiliary loss: "
+				f"expected {num_channels}, got {len(chunk_class_ids)}"
+			)
+
+		aux_label_map = self._resize_label_map_to_logits(
+			label_map=label_map,
+			target_hw=tuple(extra_logits.shape[-2:]),
+		)
+
+		target, valid_mask = self._build_chunk_targets(
+			label_map=aux_label_map,
+			chunk_class_ids=chunk_class_ids,
+			num_channels=num_channels,
+		)
+
+		present_pair_mask = self._build_present_pair_mask(
+			target=target,
+			valid_mask=valid_mask,
+		)
+
+		num_present_pairs = int(present_pair_mask.sum().item())
+		if num_present_pairs > 0:
+			class_weights = self._build_dynamic_class_weights(
+				target=target,
+				valid_mask=valid_mask,
+				present_pair_mask=present_pair_mask,
+			)
+
+			loss_bce = self._binary_cross_entropy_present_balanced_mean(
+				logits=extra_logits,
+				target=target,
+				valid_mask=valid_mask,
+				present_pair_mask=present_pair_mask,
+				class_weights=class_weights,
+			)
+
+			loss_dice = self._dice_loss_present_mean_from_logits(
+				logits=extra_logits,
+				target=target,
+				valid_mask=valid_mask,
+				present_pair_mask=present_pair_mask,
+			)
+		else:
+			loss_bce = zero
+			loss_dice = zero
+
+		absent_pair_mask = self._build_extra_token_absent_pair_mask(
+			present_pair_mask=present_pair_mask,
+			chunk_class_ids=chunk_class_ids,
+		)
+
+		if absent_pair_mask.any():
+			absent_logits = extra_logits[absent_pair_mask]
+			absent_logits = absent_logits.flatten(1)
+
+			num_spatial = int(absent_logits.shape[1])
+			topk_ratio = float(self.cfg.extra_token_aux_absent_topk_ratio)
+			topk_ratio = max(0.0, min(1.0, topk_ratio))
+			topk = max(1, int(num_spatial * topk_ratio))
+
+			top_logits = absent_logits.topk(k=topk, dim=1).values
+			loss_absent = F.softplus(top_logits).mean()
+		else:
+			loss_absent = zero
+
+		loss_extra_token_aux = float(self.cfg.extra_token_aux_loss_weight) * (
+			float(self.cfg.extra_token_aux_bce_weight) * loss_bce
+			+ float(self.cfg.extra_token_aux_dice_weight) * loss_dice
+			+ float(self.cfg.extra_token_aux_absent_weight) * loss_absent
+		)
+
+		return {
+			"loss_extra_token_aux_bce": loss_bce,
+			"loss_extra_token_aux_dice": loss_dice,
+			"loss_extra_token_aux_absent": loss_absent,
+			"loss_extra_token_aux": loss_extra_token_aux,
+		}
 	
 	def forward(
 		self,
@@ -444,6 +609,7 @@ class SemanticCriterion(nn.Module):
 		semantic_logits = self._extract_semantic_logits(outputs)
 		presence_logits = self._extract_presence_logits(outputs)
 		final_logits = self._extract_final_logits(outputs)
+		extra_token_aux_logits = self._extract_extra_token_aux_logits(outputs)
 
 		if semantic_logits.shape[:2] != presence_logits.shape:
 			raise ValueError(
@@ -458,6 +624,14 @@ class SemanticCriterion(nn.Module):
 				f"final_logits.shape={tuple(final_logits.shape)}, "
 				f"semantic_logits.shape={tuple(semantic_logits.shape)}"
 			)
+
+		if extra_token_aux_logits is not None:
+			if extra_token_aux_logits.shape[:2] != semantic_logits.shape[:2]:
+				raise ValueError(
+					"Shape mismatch between extra_token_aux_logits and semantic_logits: "
+					f"extra_token_aux_logits.shape[:2]={tuple(extra_token_aux_logits.shape[:2])}, "
+					f"semantic_logits.shape[:2]={tuple(semantic_logits.shape[:2])}"
+				)
 
 		label_map = self._extract_label_map(targets)
 		label_map = self._resize_label_map_to_logits(
@@ -482,6 +656,12 @@ class SemanticCriterion(nn.Module):
 			chunk_class_ids=chunk_class_ids,
 		)
 
+		extra_aux_losses = self._extra_token_aux_loss(
+			extra_logits=extra_token_aux_logits,
+			label_map=label_map,
+			chunk_class_ids=chunk_class_ids,
+		)
+
 		num_valid_pixels = int((label_map != int(self.cfg.ignore_index)).sum().item())
 		if num_valid_pixels <= 0:
 			zero = semantic_logits.sum() * 0.0
@@ -492,6 +672,10 @@ class SemanticCriterion(nn.Module):
 				"loss_final_bce": zero,
 				"loss_final_dice": zero,
 				"loss_final_ce": zero,
+				"loss_extra_token_aux_bce": zero,
+				"loss_extra_token_aux_dice": zero,
+				"loss_extra_token_aux_absent": zero,
+				"loss_extra_token_aux": zero,
 				"total_loss": zero,
 				"num_valid": torch.tensor(0, device=semantic_logits.device, dtype=torch.long),
 			}
@@ -521,6 +705,7 @@ class SemanticCriterion(nn.Module):
 			total_loss = (
 					float(self.cfg.presence_bce_weight) * loss_presence_bce
 					+ float(self.cfg.final_ce_weight) * loss_final_ce
+					+ extra_aux_losses["loss_extra_token_aux"]
 			)
 
 			num_valid_for_backward = max(num_valid_pixels, num_ce_valid)
@@ -532,6 +717,10 @@ class SemanticCriterion(nn.Module):
 				"loss_final_bce": zero,
 				"loss_final_dice": zero,
 				"loss_final_ce": loss_final_ce,
+				"loss_extra_token_aux_bce": extra_aux_losses["loss_extra_token_aux_bce"],
+				"loss_extra_token_aux_dice": extra_aux_losses["loss_extra_token_aux_dice"],
+				"loss_extra_token_aux_absent": extra_aux_losses["loss_extra_token_aux_absent"],
+				"loss_extra_token_aux": extra_aux_losses["loss_extra_token_aux"],
 				"total_loss": total_loss,
 				"num_valid": torch.tensor(
 					num_valid_for_backward,
@@ -588,6 +777,7 @@ class SemanticCriterion(nn.Module):
 				+ float(self.cfg.final_bce_weight) * loss_final_bce
 				+ float(self.cfg.final_dice_weight) * loss_final_dice
 				+ float(self.cfg.final_ce_weight) * loss_final_ce
+				+ extra_aux_losses["loss_extra_token_aux"]
 		)
 
 		return {
@@ -597,6 +787,10 @@ class SemanticCriterion(nn.Module):
 			"loss_final_bce": loss_final_bce,
 			"loss_final_dice": loss_final_dice,
 			"loss_final_ce": loss_final_ce,
+			"loss_extra_token_aux_bce": extra_aux_losses["loss_extra_token_aux_bce"],
+			"loss_extra_token_aux_dice": extra_aux_losses["loss_extra_token_aux_dice"],
+			"loss_extra_token_aux_absent": extra_aux_losses["loss_extra_token_aux_absent"],
+			"loss_extra_token_aux": extra_aux_losses["loss_extra_token_aux"],
 			"total_loss": total_loss,
 			"num_valid": torch.tensor(
 				num_valid_pixels,

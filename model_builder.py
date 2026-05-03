@@ -118,11 +118,19 @@ class CriterionConfig:
     final_bce_weight: float = 0.4
     final_dice_weight: float = 0.5
     final_ce_weight: float = 1.0
-	
+
+    extra_token_aux_loss_weight: float = 0.1
+    extra_token_aux_bce_weight: float = 0.03
+    extra_token_aux_dice_weight: float = 0.03
+    extra_token_aux_absent_weight: float = 0.01
+    extra_token_aux_absent_topk_ratio: float = 0.05
+    extra_token_aux_exclude_bg: bool = True
+    extra_token_aux_bg_idx: int = 0
+
     bce_class_balance_clamp_min: float = 0.2
     bce_class_balance_clamp_max: float = 5.0
     eps: float = 1e-6
-	
+
     presence_pos_weight: float = 1.0
 
 @dataclass
@@ -619,8 +627,35 @@ class SAM3ModelBuilder(FrozenModuleMixin):
                 final_bce_weight=float(cfg.criterion_cfg.final_bce_weight),
                 final_dice_weight=float(cfg.criterion_cfg.final_dice_weight),
                 final_ce_weight=float(cfg.criterion_cfg.final_ce_weight),
-                bce_class_balance_clamp_min=float(cfg.criterion_cfg.bce_class_balance_clamp_min),
-                bce_class_balance_clamp_max=float(cfg.criterion_cfg.bce_class_balance_clamp_max),
+
+                extra_token_aux_loss_weight=float(
+                    cfg.criterion_cfg.extra_token_aux_loss_weight
+                ),
+                extra_token_aux_bce_weight=float(
+                    cfg.criterion_cfg.extra_token_aux_bce_weight
+                ),
+                extra_token_aux_dice_weight=float(
+                    cfg.criterion_cfg.extra_token_aux_dice_weight
+                ),
+                extra_token_aux_absent_weight=float(
+                    cfg.criterion_cfg.extra_token_aux_absent_weight
+                ),
+                extra_token_aux_absent_topk_ratio=float(
+                    cfg.criterion_cfg.extra_token_aux_absent_topk_ratio
+                ),
+                extra_token_aux_exclude_bg=bool(
+                    cfg.criterion_cfg.extra_token_aux_exclude_bg
+                ),
+                extra_token_aux_bg_idx=int(
+                    cfg.criterion_cfg.extra_token_aux_bg_idx
+                ),
+
+                bce_class_balance_clamp_min=float(
+                    cfg.criterion_cfg.bce_class_balance_clamp_min
+                ),
+                bce_class_balance_clamp_max=float(
+                    cfg.criterion_cfg.bce_class_balance_clamp_max
+                ),
                 eps=float(cfg.criterion_cfg.eps),
                 presence_pos_weight=float(cfg.criterion_cfg.presence_pos_weight),
             )

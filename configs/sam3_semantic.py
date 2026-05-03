@@ -3,7 +3,7 @@ _base_ = [
     "./_base_/optimizer.py",
     "./_base_/schedule.py",
     "./_base_/visualization.py",
-    "./datasets/potsdam.py",
+    "./datasets/isaid.py",
 ]
 
 model = dict(
@@ -35,29 +35,34 @@ model = dict(
     freeze_cfg=dict(
         train_adapters_only=True,
         trainable_modules=[
-            # CLIP text projection
-            "core.clip_text_proj",
+            # CLIP native image -> CLIP text attention
+            "core.clip_native_image_to_text_attn",
+            "core.clip_native_image_to_text_norm",
 
-            # image fusion
-            "core.clip_sam_image_fusion",
+            # CLIP native space -> SAM3 hidden dim
+            "core.clip_hv_proj",
 
-            # CLIP text -> fused image attention
-            "core.clip_text_to_fused_image_attn",
-            "core.clip_text_to_fused_image_norm",
+            # SAM3 text -> CLIP-enhanced image-token attention
+            "core.sam3_to_clip_hv_attn",
+            "core.sam3_to_clip_hv_norm",
 
-            # CLIP token -> SAM3 text attention
-            "core.clip_to_sam3_text_attn",
-            "core.clip_to_sam3_text_norm",
+            # distinguish extra tokens from original SAM3 text tokens
+            "core.extra_type_embed",
 
-            # dynamic gate
-            "core.clip_dynamic_gate",
+            # extra token auxiliary mask head
+            "core.extra_token_mask_query_proj",
+            "core.extra_token_mask_memory_proj",
+            "core.extra_token_logit_scale",
+
+            # new presence seed
+            "core.presence_seed_proj",
 
             # presence branch
-            "core.presence_query_proj",
             "core.presence_cross_attn",
             "core.presence_cross_attn_norm",
             "core.presence_head",
 
+            # final logits modulation
             "adapter.presence_modulation_alpha",
         ],
         frozen_modules=[],
@@ -75,14 +80,23 @@ model = dict(
         bce_weight=0.4,
         dice_weight=0.1,
 
-        # presence supervision
-        presence_bce_weight=1.0,
+        # weakened presence supervision
+        presence_bce_weight=0.2,
         presence_pos_weight=1.0,
 
         # final score map supervision
         final_bce_weight=0.1,
-		final_dice_weight=0.1,
+        final_dice_weight=0.1,
         final_ce_weight=0.1,
+
+        # extra token auxiliary supervision
+        extra_token_aux_loss_weight=0.1,
+        extra_token_aux_bce_weight=0.03,
+        extra_token_aux_dice_weight=0.03,
+        extra_token_aux_absent_weight=0.01,
+        extra_token_aux_absent_topk_ratio=0.05,
+        extra_token_aux_exclude_bg=True,
+        extra_token_aux_bg_idx=0,
 
         # other loss hyper-parameters
         bce_class_balance_clamp_min=0.2,
@@ -117,29 +131,31 @@ optim_wrapper = dict(
         paramwise_cfg=dict(
             norm_decay_mult=0.0,
             custom_keys={
-                # -------- 第一层：CLIP text projection，最稳 --------
-                "core.clip_text_proj": dict(lr_mult=1.0, decay_mult=1.0),
+                # -------- CLIP native image -> text attention --------
+                "core.clip_native_image_to_text_attn": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.clip_native_image_to_text_norm": dict(lr_mult=2.0, decay_mult=0.0),
 
-                # -------- 第二层：CLIP / SAM3 图像融合，新模块，中速偏快 --------
-                "core.clip_sam_image_fusion": dict(lr_mult=4.0, decay_mult=1.0),
-                "core.clip_sam_image_fusion.fusion_scale": dict(lr_mult=6.0, decay_mult=0.0),
+                # -------- CLIP hidden visual tokens -> SAM3 hidden dim --------
+                "core.clip_hv_proj": dict(lr_mult=2.0, decay_mult=1.0),
 
-                # -------- 第三层：文本到融合图像、文本到 SAM3 文本注意力 --------
-                "core.clip_text_to_fused_image_attn": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.clip_text_to_fused_image_norm": dict(lr_mult=2.0, decay_mult=0.0),
+                # -------- SAM3 text token attends to CLIP-enhanced visual tokens --------
+                "core.sam3_to_clip_hv_attn": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.sam3_to_clip_hv_norm": dict(lr_mult=2.0, decay_mult=0.0),
 
-                "core.clip_to_sam3_text_attn": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.clip_to_sam3_text_norm": dict(lr_mult=2.0, decay_mult=0.0),
+                # -------- extra token identity and auxiliary mask head --------
+                "core.extra_type_embed": dict(lr_mult=2.0, decay_mult=0.0),
+                "core.extra_token_mask_query_proj": dict(lr_mult=3.0, decay_mult=1.0),
+                "core.extra_token_mask_memory_proj": dict(lr_mult=3.0, decay_mult=1.0),
+                "core.extra_token_logit_scale": dict(lr_mult=1.0, decay_mult=0.0),
 
-                # -------- 第四层：直接控制融合强度 / 最终调制，偏快 --------
-                "core.clip_dynamic_gate": dict(lr_mult=6.0, decay_mult=0.0),
-                "adapter.presence_modulation_alpha": dict(lr_mult=4.0, decay_mult=0.0),
+                # -------- presence branch, keep moderate --------
+                "core.presence_seed_proj": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.presence_cross_attn": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.presence_cross_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
+                "core.presence_head": dict(lr_mult=2.0, decay_mult=1.0),
 
-                # -------- 第五层：presence 分支，最快 --------
-                "core.presence_query_proj": dict(lr_mult=8.0, decay_mult=1.0),
-                "core.presence_cross_attn": dict(lr_mult=8.0, decay_mult=1.0),
-                "core.presence_cross_attn_norm": dict(lr_mult=8.0, decay_mult=0.0),
-                "core.presence_head": dict(lr_mult=8.0, decay_mult=1.0),
+                # -------- final logits modulation --------
+                "adapter.presence_modulation_alpha": dict(lr_mult=1.0, decay_mult=0.0),
             }
         ),
     )

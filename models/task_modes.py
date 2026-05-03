@@ -22,6 +22,8 @@ class ModelOutputKeys:
     final_score_map: str = "final_score_map"
     final_pred: str = "final_pred"
 
+    extra_token_aux_logits: str = "extra_token_aux_logits"
+
 
 OUTPUT_KEYS = ModelOutputKeys()
 
