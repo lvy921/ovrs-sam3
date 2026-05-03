@@ -21,6 +21,10 @@ model = dict(
         model_name="ViT-L-14",
         pretrained="weights/RemoteCLIP-ViT-L-14.pt",
         default_output="feat_map",
+
+        image_encoder_mode="full_vit_dense",
+        maskclip_skip_last_layers=1,
+
         extra_token_templates=[
             "a remote sensing image of {}.",
             "an aerial image of {}.",
@@ -29,7 +33,6 @@ model = dict(
         ],
         num_extra_tokens=4,
         normalize_label_for_clip=True,
-        clip_token_global_scale=2,
     ),
 
     freeze_cfg=dict(
@@ -78,7 +81,7 @@ model = dict(
 
         # original semantic mask supervision
         bce_weight=0.4,
-        dice_weight=0.1,
+        dice_weight=1.0,
 
         # weakened presence supervision
         presence_bce_weight=0.2,
@@ -91,11 +94,11 @@ model = dict(
 
         # extra token auxiliary supervision
         extra_token_aux_loss_weight=0.1,
-        extra_token_aux_bce_weight=0.03,
-        extra_token_aux_dice_weight=0.03,
-        extra_token_aux_absent_weight=0.01,
+        extra_token_aux_bce_weight=0.3,
+        extra_token_aux_dice_weight=0.3,
+        extra_token_aux_absent_weight=0.1,
         extra_token_aux_absent_topk_ratio=0.05,
-        extra_token_aux_exclude_bg=True,
+        extra_token_aux_exclude_bg=False,
         extra_token_aux_bg_idx=0,
 
         # other loss hyper-parameters

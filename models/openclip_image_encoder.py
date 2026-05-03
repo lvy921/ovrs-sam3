@@ -9,41 +9,28 @@ import torch.nn.functional as F
 
 
 class OpenCLIPImageEncoder(nn.Module):
-    """
-    MaskCLIP-style OpenCLIP ViT dense image encoder.
-
-    输出:
-        feat_map: [B, D_align, Hc, Wc]
-
-    符号说明:
-        B 表示 batch size。
-        D_align 表示 CLIP 图文对齐空间维度。
-        Hc, Wc 表示 CLIP patch 网格高和宽。
-
-    实现逻辑对齐官方 MaskCLIP ViT:
-        1. 正常执行到最后一个 transformer block 之前；
-        2. 在最后一个 block 中只走 V 分支；
-        3. 对 V 做 attn.out_proj；
-        4. 做 attention residual；
-        5. 做最后 block 的 FFN；
-        6. 做 visual.ln_post；
-        7. 做 visual.proj；
-        8. reshape 成 dense feature map。
-    """
-
     def __init__(
         self,
         visual: nn.Module,
         default_output: str = "feat_map",
+        image_encoder_mode: str = "maskclip",
         maskclip_skip_last_layers: int = 1,
     ) -> None:
         super().__init__()
 
         self.visual = visual
         self.default_output = str(default_output)
+        self.image_encoder_mode = str(image_encoder_mode).strip().lower()
         self.maskclip_skip_last_layers = int(maskclip_skip_last_layers)
 
-        if self.maskclip_skip_last_layers <= 0:
+        valid_modes = {"maskclip", "full_vit_dense"}
+        if self.image_encoder_mode not in valid_modes:
+            raise ValueError(
+                f"Unknown image_encoder_mode={image_encoder_mode!r}. "
+                f"Supported modes are: {sorted(valid_modes)}"
+            )
+
+        if self.image_encoder_mode == "maskclip" and self.maskclip_skip_last_layers <= 0:
             raise ValueError(
                 f"maskclip_skip_last_layers must be positive, got {self.maskclip_skip_last_layers}"
             )
@@ -339,30 +326,13 @@ class OpenCLIPImageEncoder(nn.Module):
         proj = proj.to(device=x.device, dtype=x.dtype)
         return x @ proj
 
-    def _forward_maskclip_dense_tokens(
-        self,
-        images: torch.Tensor,
+    def _prepare_vit_tokens(
+            self,
+            images: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[int, int]]:
-        """
-        Args:
-            images: [B, 3, H, W]
-
-        Returns:
-            dense_tokens: [B, Hc * Wc, output_dim]
-            grid_hw: (Hc, Wc)
-        """
         if not self._is_openclip_vit_like():
             raise NotImplementedError(
-                "MaskCLIP-style dense output expects an OpenCLIP ViT-like visual tower."
-            )
-
-        blocks = self._get_resblocks()
-        block_index = len(blocks) - self.maskclip_skip_last_layers
-
-        if block_index < 0:
-            raise ValueError(
-                "maskclip_skip_last_layers is larger than the number of transformer blocks: "
-                f"skip={self.maskclip_skip_last_layers}, num_blocks={len(blocks)}"
+                "Dense OpenCLIP image output expects an OpenCLIP ViT-like visual tower."
             )
 
         x = self.visual.conv1(images)
@@ -390,6 +360,23 @@ class OpenCLIPImageEncoder(nn.Module):
 
         x = self.visual.patch_dropout(x)
         x = self.visual.ln_pre(x)
+
+        return x, (int(grid_h), int(grid_w))
+
+    def _forward_maskclip_dense_tokens(
+            self,
+            images: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
+        blocks = self._get_resblocks()
+        block_index = len(blocks) - self.maskclip_skip_last_layers
+
+        if block_index < 0:
+            raise ValueError(
+                "maskclip_skip_last_layers is larger than the number of transformer blocks: "
+                f"skip={self.maskclip_skip_last_layers}, num_blocks={len(blocks)}"
+            )
+
+        x, (grid_h, grid_w) = self._prepare_vit_tokens(images)
 
         for block in blocks[:block_index]:
             x = self._call_resblock(block, x)
@@ -436,11 +423,40 @@ class OpenCLIPImageEncoder(nn.Module):
         dense_tokens = self._apply_visual_ln_post_and_projection(patch_tokens)
         return dense_tokens, (int(grid_h), int(grid_w))
 
+    def _forward_full_vit_dense_tokens(
+            self,
+            images: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
+        blocks = self._get_resblocks()
+        x, (grid_h, grid_w) = self._prepare_vit_tokens(images)
+
+        for block in blocks:
+            x = self._call_resblock(block, x)
+
+        patch_tokens = x[:, 1:].contiguous()
+
+        expected_num_tokens = int(grid_h) * int(grid_w)
+        if patch_tokens.shape[1] != expected_num_tokens:
+            raise ValueError(
+                "Patch token count mismatch: "
+                f"expected {expected_num_tokens}, got {patch_tokens.shape[1]}"
+            )
+
+        dense_tokens = self._apply_visual_ln_post_and_projection(patch_tokens)
+        return dense_tokens, (int(grid_h), int(grid_w))
+
     def encode_image(self, images: torch.Tensor) -> torch.Tensor:
         self.visual.eval()
 
         with torch.no_grad():
-            dense_tokens, (grid_h, grid_w) = self._forward_maskclip_dense_tokens(images)
+            if self.image_encoder_mode == "maskclip":
+                dense_tokens, (grid_h, grid_w) = self._forward_maskclip_dense_tokens(images)
+            elif self.image_encoder_mode == "full_vit_dense":
+                dense_tokens, (grid_h, grid_w) = self._forward_full_vit_dense_tokens(images)
+            else:
+                raise RuntimeError(
+                    f"Unexpected image_encoder_mode={self.image_encoder_mode!r}"
+                )
 
         feat_map = dense_tokens.reshape(
             images.shape[0],

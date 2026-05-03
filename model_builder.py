@@ -99,13 +99,15 @@ class OpenCLIPConfig:
     pretrained: Optional[str] = None
     default_output: str = "feat_map"
 
+    image_encoder_mode: str = "maskclip"
+    maskclip_skip_last_layers: int = 1
+
     extra_token_templates: list[str] = field(default_factory=lambda: [
         "a remote sensing image of {}.",
         "an aerial image of {}.",
     ])
     num_extra_tokens: int = 2
     normalize_label_for_clip: bool = True
-    clip_token_global_scale: float = 0.3
 
 
 @dataclass
@@ -490,6 +492,8 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         image_encoder = OpenCLIPImageEncoder(
             visual=clip_model.visual,
             default_output=openclip_cfg.default_output,
+            image_encoder_mode=openclip_cfg.image_encoder_mode,
+            maskclip_skip_last_layers=openclip_cfg.maskclip_skip_last_layers,
         )
 
         return text_encoder, image_encoder

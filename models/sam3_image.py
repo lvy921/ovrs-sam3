@@ -359,15 +359,16 @@ class Sam3Image(torch.nn.Module):
         return feats, mask
 
     def _build_clip_hv_native(
-        self,
-        clip_image_feat_map_native: torch.Tensor,
-        clip_text_tokens_native: torch.Tensor,
+            self,
+            clip_image_feat_map_native: torch.Tensor,
+            clip_text_tokens_native: torch.Tensor,
     ) -> torch.Tensor:
         if self.clip_native_image_to_text_attn is None or self.clip_native_image_to_text_norm is None:
             raise RuntimeError("OpenCLIP native attention modules are not initialized.")
 
         batch_size, image_dim, grid_h, grid_w = clip_image_feat_map_native.shape
         num_classes, num_templates, text_dim = clip_text_tokens_native.shape
+
         if image_dim != text_dim:
             raise ValueError(f"CLIP image/text dim mismatch: {image_dim} vs {text_dim}.")
 
@@ -376,12 +377,42 @@ class Sam3Image(torch.nn.Module):
         clip_text_tokens_native = clip_text_tokens_native.to(device=device, dtype=dtype)
 
         num_clip_tokens = int(grid_h) * int(grid_w)
-        image_tokens = clip_image_feat_map_native.flatten(2).transpose(1, 2).contiguous()
-        query = image_tokens[:, None].expand(batch_size, num_classes, num_clip_tokens, image_dim)
-        query = query.reshape(batch_size * num_classes, num_clip_tokens, image_dim).contiguous()
 
-        key_value = clip_text_tokens_native[None].expand(batch_size, num_classes, num_templates, text_dim)
-        key_value = key_value.reshape(batch_size * num_classes, num_templates, text_dim).contiguous()
+        # [B, D_clip, Hc, Wc] -> [B, N_clip, D_clip]
+        image_tokens = clip_image_feat_map_native.flatten(2).transpose(1, 2).contiguous()
+
+        image_tokens = F.normalize(image_tokens, dim=-1, eps=1e-6)
+        clip_text_tokens_native = F.normalize(
+            clip_text_tokens_native,
+            dim=-1,
+            eps=1e-6,
+        )
+
+        # [B, N_clip, D_clip] -> [B*C_chunk, N_clip, D_clip]
+        query = image_tokens[:, None].expand(
+            batch_size,
+            num_classes,
+            num_clip_tokens,
+            image_dim,
+        )
+        query = query.reshape(
+            batch_size * num_classes,
+            num_clip_tokens,
+            image_dim,
+        ).contiguous()
+
+        # [C_chunk, K, D_clip] -> [B*C_chunk, K, D_clip]
+        key_value = clip_text_tokens_native[None].expand(
+            batch_size,
+            num_classes,
+            num_templates,
+            text_dim,
+        )
+        key_value = key_value.reshape(
+            batch_size * num_classes,
+            num_templates,
+            text_dim,
+        ).contiguous()
 
         text_message, _ = self.clip_native_image_to_text_attn(
             query=query,
@@ -389,8 +420,15 @@ class Sam3Image(torch.nn.Module):
             value=key_value,
             need_weights=False,
         )
+
         hv_pair = self.clip_native_image_to_text_norm(query + text_message)
-        return hv_pair.reshape(batch_size, num_classes, num_clip_tokens, image_dim).contiguous()
+
+        return hv_pair.reshape(
+            batch_size,
+            num_classes,
+            num_clip_tokens,
+            image_dim,
+        ).contiguous()
 
     def _build_extra_tokens_from_clip_hv(
         self,

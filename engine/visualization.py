@@ -27,7 +27,10 @@ class VisualizerConfig:
 
     save_presence_summary: bool = True
     save_score_heatmaps: bool = True
+
     save_clip_argmax_prediction: bool = True
+
+    save_clip_score_heatmaps: bool = True
 
     vis_prob: float = 0.05
     max_samples_per_epoch: Optional[int] = 50
@@ -229,14 +232,27 @@ class PresenceAnalysisTask(VisualizationTask):
                     class_names=class_names,
                 )
 
-class ClipDenseArgmaxTask(VisualizationTask):
-    name = "clip_dense_argmax"
+class ClipImageTextScoreTask(VisualizationTask):
+    name = "clip_image_text_score"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
-        if not manager.cfg.save_clip_argmax_prediction:
+        if (
+            not manager.cfg.save_clip_argmax_prediction
+            and not manager.cfg.save_clip_score_heatmaps
+        ):
             return
 
-        clip_score_map = manager._build_clip_score_map_for_visualization(
+        outputs = ctx.semantic_outputs
+        presence_score = outputs.get(OUTPUT_KEYS.presence_score, None)
+        if presence_score is None:
+            return
+
+        if presence_score.dim() != 2:
+            raise ValueError(
+                f"Expected presence_score as [B, C], got {tuple(presence_score.shape)}"
+            )
+
+        clip_score_map = manager._build_clip_image_text_score_map_for_visualization(
             model=ctx.model,
             batch=ctx.batch,
         )
@@ -247,6 +263,18 @@ class ClipDenseArgmaxTask(VisualizationTask):
             raise ValueError(
                 f"Expected clip_score_map as [B, C, Hc, Wc], got {tuple(clip_score_map.shape)}"
             )
+
+        if clip_score_map.shape[:2] != presence_score.shape:
+            raise ValueError(
+                "Shape mismatch between clip_score_map and presence_score: "
+                f"clip_score_map.shape[:2]={tuple(clip_score_map.shape[:2])}, "
+                f"presence_score.shape={tuple(presence_score.shape)}"
+            )
+
+        try:
+            class_names = [str(x) for x in ctx.batch.find_metadatas[0].class_names]
+        except Exception:
+            class_names = None
 
         num_classes = int(clip_score_map.shape[1])
 
@@ -266,20 +294,32 @@ class ClipDenseArgmaxTask(VisualizationTask):
                 size=out_hw,
                 mode="bilinear",
                 align_corners=False,
-            )[0]
+            )[0]  # [C, H, W]
 
-            clip_pred = clip_score_up.argmax(dim=0).long()
+            presence_scores_b = presence_score[b]  # [C]
 
-            manager._colorize_label_map(
-                clip_pred.detach().cpu(),
-                num_classes=num_classes,
-            ).save(sample_dir / "clip_argmax_pred.png")
+            if manager.cfg.save_clip_argmax_prediction:
+                clip_pred = clip_score_up.argmax(dim=0).long()
 
-            manager._overlay_label_map(
-                overlay_image,
-                clip_pred.detach().cpu(),
-                num_classes=num_classes,
-            ).save(sample_dir / "clip_argmax_overlay.png")
+                manager._colorize_label_map(
+                    clip_pred.detach().cpu(),
+                    num_classes=num_classes,
+                ).save(sample_dir / "clip_argmax_pred.png")
+
+                manager._overlay_label_map(
+                    overlay_image,
+                    clip_pred.detach().cpu(),
+                    num_classes=num_classes,
+                ).save(sample_dir / "clip_argmax_overlay.png")
+
+            if manager.cfg.save_clip_score_heatmaps:
+                manager._save_clip_score_heatmaps(
+                    sample_dir=sample_dir,
+                    clip_scores=clip_score_up,
+                    presence_scores=presence_scores_b,
+                    out_hw=out_hw,
+                    class_names=class_names,
+                )
 
 class VisualizationManager:
     def __init__(self, cfg: VisualizerConfig):
@@ -293,7 +333,7 @@ class VisualizationManager:
         return [
             BaseSemanticOverlayTask(),
             PresenceAnalysisTask(),
-            ClipDenseArgmaxTask(),
+            ClipImageTextScoreTask(),
         ]
 
     @staticmethod
@@ -305,22 +345,11 @@ class VisualizationManager:
         model = cls._unwrap_model(model)
         return getattr(model, "core", None)
 
-    def _build_clip_score_map_for_visualization(
+    def _build_clip_image_text_score_map_for_visualization(
             self,
             model: torch.nn.Module,
             batch: Any,
     ) -> Optional[torch.Tensor]:
-        """
-        Build CLIP dense score map only for visualization.
-
-        Returns:
-            clip_score_map: [B, C, Hc, Wc]
-
-        符号说明：
-            B 表示 batch size。
-            C 表示类别数。
-            Hc, Wc 表示 CLIP patch score map 的高和宽。
-        """
         core = self._extract_core_model(model)
         if core is None:
             return None
@@ -328,9 +357,7 @@ class VisualizationManager:
         required_attrs = [
             "clip_image_encoder",
             "clip_text_encoder",
-            "ensure_text_cache",
-            "_build_clip_image_cache",
-            "_build_clip_dense_score_map",
+            "_prepare_openclip_image_batch",
         ]
         for name in required_attrs:
             if not hasattr(core, name):
@@ -343,32 +370,84 @@ class VisualizationManager:
         if len(class_texts) == 0:
             return None
 
+        raw_images = getattr(batch, "raw_images", None)
+        if raw_images is None:
+            return None
+
+        templates = list(getattr(core, "clip_extra_token_templates", []))
+        if len(templates) == 0:
+            return None
+
+        normalize_label = bool(getattr(core, "normalize_label_for_clip", True))
         device = core.device
 
         with torch.no_grad():
-            core.ensure_text_cache(
-                class_texts=class_texts,
+            clip_img_batch = core._prepare_openclip_image_batch(
+                raw_images=raw_images,
                 device=device,
             )
 
-            clip_image_cache = core._build_clip_image_cache(
-                input=batch,
+            clip_image_feat_map = core.clip_image_encoder(clip_img_batch)
+            if not isinstance(clip_image_feat_map, torch.Tensor):
+                return None
+            if clip_image_feat_map.dim() != 4:
+                raise ValueError(
+                    "clip_image_encoder must return [B, D_clip, Hc, Wc], "
+                    f"got {tuple(clip_image_feat_map.shape)}"
+                )
+
+            clip_text_tokens = core.clip_text_encoder.encode_prompt_templates(
+                class_names=class_texts,
+                templates=templates,
                 device=device,
-            )
-            if clip_image_cache is None:
-                return None
-
-            text_cache = getattr(core, "_text_cache", None)
-            if text_cache is None or "clip_text_tokens_native" not in text_cache:
-                return None
-
-            clip_score_map = core._build_clip_dense_score_map(
-                clip_image_cache=clip_image_cache,
-                clip_text_tokens=text_cache["clip_text_tokens_native"],
+                normalize_label=normalize_label,
+                normalize=False,
             )
 
-        if clip_score_map is None:
-            return None
+            if clip_text_tokens.dim() != 3:
+                raise ValueError(
+                    "Expected clip_text_tokens as [C, K, D_clip], "
+                    f"got {tuple(clip_text_tokens.shape)}"
+                )
+
+            batch_size, image_dim, grid_h, grid_w = clip_image_feat_map.shape
+            num_classes, num_templates, text_dim = clip_text_tokens.shape
+
+            if image_dim != text_dim:
+                raise ValueError(
+                    f"CLIP image/text dim mismatch: image_dim={image_dim}, text_dim={text_dim}"
+                )
+
+            if num_classes != len(class_texts):
+                raise ValueError(
+                    f"CLIP text class count mismatch: {num_classes} vs {len(class_texts)}"
+                )
+
+            # [B, D_clip, Hc, Wc] -> [B, Hc * Wc, D_clip]
+            image_features = clip_image_feat_map.flatten(2).transpose(1, 2).contiguous()
+
+            image_features = F.normalize(image_features, dim=-1, eps=1e-6)
+
+            text_features = F.normalize(clip_text_tokens, dim=-1, eps=1e-6)
+
+            # [C, K, D_clip] -> [C, D_clip]
+            text_features = text_features.mean(dim=1)
+            text_features = F.normalize(text_features, dim=-1, eps=1e-6)
+
+            # [B, Hc * Wc, D_clip] 和 [C, D_clip] 做内积
+            # 输出 [B, C, Hc * Wc]
+            clip_score = torch.einsum(
+                "bnd,cd->bcn",
+                image_features,
+                text_features,
+            )
+
+            clip_score_map = clip_score.reshape(
+                batch_size,
+                num_classes,
+                grid_h,
+                grid_w,
+            ).contiguous()
 
         return clip_score_map.detach()
 
@@ -422,6 +501,32 @@ class VisualizationManager:
             return Image.fromarray(arr, mode="RGB")
 
         raise TypeError(f"Unsupported image type: {type(image)}")
+
+    @staticmethod
+    def _to_normalized_heatmap_image(score_map: torch.Tensor, out_hw: Tuple[int, int]) -> Image.Image:
+        x = score_map.detach().cpu().float()
+        if x.dim() == 3:
+            if x.shape[0] != 1:
+                raise ValueError(f"Expected [1,H,W] or [H,W], got {tuple(x.shape)}")
+            x = x[0]
+        if x.dim() != 2:
+            raise ValueError(f"Expected [H,W], got {tuple(x.shape)}")
+
+        if tuple(x.shape[-2:]) != tuple(out_hw):
+            x = F.interpolate(
+                x[None, None],
+                size=out_hw,
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
+
+        x_min = x.min()
+        x_max = x.max()
+        x = (x - x_min) / (x_max - x_min).clamp_min(1e-6)
+
+        arr = (x.numpy() * 255.0).astype(np.uint8)
+        heat = np.stack([arr, arr, arr], axis=-1)
+        return Image.fromarray(heat, mode="RGB")
 
     @staticmethod
     def _extract_overlay_image(batch: Any, batch_index: int) -> Image.Image:
@@ -685,6 +790,65 @@ class VisualizationManager:
                 )
                 final_img.save(
                     heatmap_dir / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_final.png"
+                )
+
+    def _save_clip_score_heatmaps(
+            self,
+            sample_dir: Path,
+            clip_scores: torch.Tensor,
+            presence_scores: torch.Tensor,
+            out_hw: Tuple[int, int],
+            class_names: Optional[List[str]],
+    ) -> None:
+        if clip_scores.dim() != 3:
+            raise ValueError(f"Expected clip_scores as [C,H,W], got {tuple(clip_scores.shape)}")
+        if presence_scores.dim() != 1:
+            raise ValueError(f"Expected presence_scores as [C], got {tuple(presence_scores.shape)}")
+
+        num_classes = int(clip_scores.shape[0])
+        if presence_scores.shape[0] != num_classes:
+            raise ValueError(
+                "Class count mismatch in CLIP score heatmaps: "
+                f"clip_scores has {num_classes}, presence_scores has {presence_scores.shape[0]}"
+            )
+
+        clip_max = clip_scores.flatten(1).max(dim=1).values
+        clip_mean = clip_scores.flatten(1).mean(dim=1)
+
+        order = torch.argsort(presence_scores, descending=True)
+
+        heatmap_dir = sample_dir / "clip_score_heatmaps"
+        heatmap_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(heatmap_dir / "all_classes.txt", "w", encoding="utf-8") as f:
+            f.write("rank\tclass_id\tclass_name\tpresence_score\tclip_max\tclip_mean\n")
+
+            for rank, cls_idx in enumerate(order.tolist()):
+                class_name = (
+                    class_names[cls_idx]
+                    if class_names is not None and cls_idx < len(class_names)
+                    else f"class_{cls_idx}"
+                )
+
+                presence_value = float(presence_scores[cls_idx].item())
+                clip_max_value = float(clip_max[cls_idx].item())
+                clip_mean_value = float(clip_mean[cls_idx].item())
+
+                f.write(
+                    f"{rank}\t{cls_idx}\t{class_name}\t"
+                    f"{presence_value:.6f}\t"
+                    f"{clip_max_value:.6f}\t"
+                    f"{clip_mean_value:.6f}\n"
+                )
+
+                safe_name = self._sanitize_filename(class_name)
+                clip_img = self._to_normalized_heatmap_image(
+                    clip_scores[cls_idx],
+                    out_hw,
+                )
+
+                clip_img.save(
+                    heatmap_dir / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_clip.png"
                 )
 
     def _get_epoch_key(self, stage: str, epoch: Optional[int]) -> Tuple[str, int]:
