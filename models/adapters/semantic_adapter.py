@@ -4,87 +4,62 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ..data_misc import BatchedDatapoint
 from ..task_modes import OUTPUT_KEYS
 
 
 class SemanticSegAdapter(nn.Module):
-    def __init__(
-        self,
-        presence_base: float = 0.5,
-        init_presence_modulation_alpha: float = 1.0,
-    ):
+    def __init__(self):
         super().__init__()
-        self.presence_base = float(presence_base)
-        self.presence_modulation_alpha = nn.Parameter(
-            torch.tensor(float(init_presence_modulation_alpha))
-        )
 
     @staticmethod
-    def _extract_semantic_logits(
+    def _extract_required_tensor(
         raw_outputs: Dict[str, torch.Tensor],
+        key: str,
     ) -> torch.Tensor:
-        semantic_logits = raw_outputs.get(OUTPUT_KEYS.semantic_logits, None)
-        if semantic_logits is None:
-            raise ValueError(
-                f"Raw outputs must contain '{OUTPUT_KEYS.semantic_logits}'."
-            )
-
-        if semantic_logits.dim() == 5:
-            if semantic_logits.shape[2] != 1:
-                raise ValueError(
-                    f"Expected semantic_logits as [B, C, 1, H, W], got {tuple(semantic_logits.shape)}"
-                )
-            semantic_logits = semantic_logits[:, :, 0]
-        elif semantic_logits.dim() != 4:
-            raise ValueError(
-                f"Expected semantic_logits as [B, C, H, W] or [B, C, 1, H, W], got {tuple(semantic_logits.shape)}"
-            )
-
-        return semantic_logits
+        value = raw_outputs.get(key, None)
+        if value is None:
+            raise ValueError(f"Raw outputs must contain '{key}'.")
+        return value
 
     @staticmethod
-    def _extract_presence_logits(
+    def _extract_optional_tensor(
         raw_outputs: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        presence_logits = raw_outputs.get(OUTPUT_KEYS.presence_logits, None)
-        if presence_logits is None:
-            raise ValueError(
-                f"Raw outputs must contain '{OUTPUT_KEYS.presence_logits}'."
-            )
-
-        if presence_logits.dim() == 3:
-            if presence_logits.shape[-1] != 1:
-                raise ValueError(
-                    f"Expected presence_logits as [B, C, 1], got {tuple(presence_logits.shape)}"
-                )
-            presence_logits = presence_logits[..., 0]
-        elif presence_logits.dim() != 2:
-            raise ValueError(
-                f"Expected presence_logits as [B, C] or [B, C, 1], got {tuple(presence_logits.shape)}"
-            )
-
-        return presence_logits
-
-    @staticmethod
-    def _resize_to_match(
-        x: Optional[torch.Tensor],
-        target_hw: tuple[int, int],
+        key: str,
     ) -> Optional[torch.Tensor]:
-        if x is None:
-            return None
+        return raw_outputs.get(key, None)
 
-        if tuple(x.shape[-2:]) == tuple(target_hw):
-            return x
+    @staticmethod
+    def _ensure_4d_map(
+        x: torch.Tensor,
+        key: str,
+    ) -> torch.Tensor:
+        if x.dim() == 5:
+            if x.shape[2] != 1:
+                raise ValueError(
+                    f"Expected {key} as [B, C, 1, H, W] when 5D, "
+                    f"got {tuple(x.shape)}."
+                )
+            x = x[:, :, 0]
 
-        return F.interpolate(
-            x,
-            size=target_hw,
-            mode="bilinear",
-            align_corners=False,
-        )
+        if x.dim() != 4:
+            raise ValueError(
+                f"Expected {key} as [B, C, H, W], got {tuple(x.shape)}."
+            )
+
+        return x
+
+    @staticmethod
+    def _ensure_3d_query(
+        x: torch.Tensor,
+        key: str,
+    ) -> torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError(
+                f"Expected {key} as [B, C, D], got {tuple(x.shape)}."
+            )
+        return x
 
     @staticmethod
     def _infer_expected_num_classes(
@@ -117,66 +92,48 @@ class SemanticSegAdapter(nn.Module):
             )
 
     @staticmethod
-    def _validate_presence_class_count(
-        semantic_logits: torch.Tensor,
-        presence_logits: torch.Tensor,
+    def _validate_same_shape(
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+        lhs_key: str,
+        rhs_key: str,
     ) -> None:
-        if semantic_logits.shape[:2] != presence_logits.shape:
+        if lhs.shape != rhs.shape:
             raise ValueError(
-                "Shape mismatch between semantic_logits and presence_logits: "
-                f"semantic_logits.shape[:2]={tuple(semantic_logits.shape[:2])}, "
-                f"presence_logits.shape={tuple(presence_logits.shape)}"
+                f"Shape mismatch between {lhs_key} and {rhs_key}: "
+                f"{tuple(lhs.shape)} vs {tuple(rhs.shape)}."
             )
 
-    def _build_final_logits(
-            self,
-            semantic_logits: torch.Tensor,
-            presence_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            semantic_logits: [B, C, H, W]
-            presence_logits: [B, C]
-
-        Returns:
-            final_logits: [B, C, H, W]
-            presence_score: [B, C]
-        """
-        if semantic_logits.dim() != 4:
+    @staticmethod
+    def _validate_query_shape(
+        class_query: torch.Tensor,
+        semantic_logits: torch.Tensor,
+    ) -> None:
+        if class_query.shape[:2] != semantic_logits.shape[:2]:
             raise ValueError(
-                f"Expected semantic_logits as [B, C, H, W], got {tuple(semantic_logits.shape)}"
-            )
-        if presence_logits.dim() != 2:
-            raise ValueError(
-                f"Expected presence_logits as [B, C], got {tuple(presence_logits.shape)}"
-            )
-        if semantic_logits.shape[:2] != presence_logits.shape:
-            raise ValueError(
-                "Shape mismatch between semantic_logits and presence_logits: "
-                f"{tuple(semantic_logits.shape[:2])} vs {tuple(presence_logits.shape)}"
+                "Shape mismatch between class_query and semantic_logits: "
+                f"class_query.shape[:2]={tuple(class_query.shape[:2])}, "
+                f"semantic_logits.shape[:2]={tuple(semantic_logits.shape[:2])}."
             )
 
-        presence_score = presence_logits.sigmoid()  # [B, C]
-
-        presence_modulation_map = torch.sigmoid(
-            semantic_logits * self.presence_modulation_alpha
-        )  # [B, C, H, W]
-
-        spatial_presence = self.presence_base + (
-                presence_score[:, :, None, None] * presence_modulation_map
-        )  # [B, C, H, W]
-
-        final_logits = semantic_logits * spatial_presence  # [B, C, H, W]
-        return final_logits, presence_score
-
-    def _build_train_outputs(
+    def _build_chunk_train_outputs(
         self,
         raw_outputs: Dict[str, torch.Tensor],
         batch: BatchedDatapoint,
         expected_num_classes: Optional[int],
     ) -> Dict[str, torch.Tensor]:
-        semantic_logits = self._extract_semantic_logits(raw_outputs)
-        presence_logits = self._extract_presence_logits(raw_outputs)
+        semantic_logits = self._ensure_4d_map(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.semantic_logits),
+            OUTPUT_KEYS.semantic_logits,
+        )
+        clip_dense_logits = self._ensure_4d_map(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.clip_dense_logits),
+            OUTPUT_KEYS.clip_dense_logits,
+        )
+        class_query = self._ensure_3d_query(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.class_query),
+            OUTPUT_KEYS.class_query,
+        )
 
         actual_num_classes = int(semantic_logits.shape[1])
         expected_num_classes = self._infer_expected_num_classes(
@@ -187,38 +144,57 @@ class SemanticSegAdapter(nn.Module):
             actual_num_classes=actual_num_classes,
             expected_num_classes=expected_num_classes,
         )
-        self._validate_presence_class_count(
+        self._validate_same_shape(
+            semantic_logits,
+            clip_dense_logits,
+            OUTPUT_KEYS.semantic_logits,
+            OUTPUT_KEYS.clip_dense_logits,
+        )
+        self._validate_query_shape(
+            class_query=class_query,
             semantic_logits=semantic_logits,
-            presence_logits=presence_logits,
         )
 
-        final_logits, presence_score = self._build_final_logits(
-            semantic_logits=semantic_logits,
-            presence_logits=presence_logits,
-        )
-
-        train_outputs = {
+        outputs = {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
-            OUTPUT_KEYS.presence_logits: presence_logits,
-            OUTPUT_KEYS.presence_score: presence_score,
-            OUTPUT_KEYS.final_logits: final_logits,
+            OUTPUT_KEYS.clip_dense_logits: clip_dense_logits,
+            OUTPUT_KEYS.class_query: class_query,
         }
 
-        if OUTPUT_KEYS.extra_token_aux_logits in raw_outputs:
-            train_outputs[OUTPUT_KEYS.extra_token_aux_logits] = raw_outputs[
-                OUTPUT_KEYS.extra_token_aux_logits
-            ]
+        extra_token_aux_logits = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.extra_token_aux_logits,
+        )
+        if extra_token_aux_logits is not None:
+            outputs[OUTPUT_KEYS.extra_token_aux_logits] = self._ensure_4d_map(
+                extra_token_aux_logits,
+                OUTPUT_KEYS.extra_token_aux_logits,
+            )
 
-        return train_outputs
+        return outputs
 
-    def _build_inference_outputs(
+    def _build_final_outputs(
         self,
         raw_outputs: Dict[str, torch.Tensor],
         batch: BatchedDatapoint,
         expected_num_classes: Optional[int],
     ) -> Dict[str, torch.Tensor]:
-        semantic_logits = self._extract_semantic_logits(raw_outputs)
-        presence_logits = self._extract_presence_logits(raw_outputs)
+        semantic_logits = self._ensure_4d_map(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.semantic_logits),
+            OUTPUT_KEYS.semantic_logits,
+        )
+        final_logits = self._ensure_4d_map(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.final_logits),
+            OUTPUT_KEYS.final_logits,
+        )
+        suppression_logits = self._ensure_4d_map(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.suppression_logits),
+            OUTPUT_KEYS.suppression_logits,
+        )
+        suppression_gate = self._ensure_4d_map(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.suppression_gate),
+            OUTPUT_KEYS.suppression_gate,
+        )
 
         actual_num_classes = int(semantic_logits.shape[1])
         expected_num_classes = self._infer_expected_num_classes(
@@ -229,75 +205,103 @@ class SemanticSegAdapter(nn.Module):
             actual_num_classes=actual_num_classes,
             expected_num_classes=expected_num_classes,
         )
-        self._validate_presence_class_count(
-            semantic_logits=semantic_logits,
-            presence_logits=presence_logits,
-        )
+
+        for key, value in (
+            (OUTPUT_KEYS.final_logits, final_logits),
+            (OUTPUT_KEYS.suppression_logits, suppression_logits),
+            (OUTPUT_KEYS.suppression_gate, suppression_gate),
+        ):
+            self._validate_same_shape(
+                semantic_logits,
+                value,
+                OUTPUT_KEYS.semantic_logits,
+                key,
+            )
 
         semantic_score_map = semantic_logits.sigmoid()
-
-        final_logits, presence_score = self._build_final_logits(
-            semantic_logits=semantic_logits,
-            presence_logits=presence_logits,
-        )
-
         final_score_map = final_logits.sigmoid()
         final_pred = final_score_map.argmax(dim=1)
 
-        return {
+        outputs = {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
             OUTPUT_KEYS.semantic_score_map: semantic_score_map,
-            OUTPUT_KEYS.presence_logits: presence_logits,
-            OUTPUT_KEYS.presence_score: presence_score,
             OUTPUT_KEYS.final_logits: final_logits,
             OUTPUT_KEYS.final_score_map: final_score_map,
             OUTPUT_KEYS.final_pred: final_pred,
+            OUTPUT_KEYS.suppression_logits: suppression_logits,
+            OUTPUT_KEYS.suppression_gate: suppression_gate,
         }
+
+        clip_dense_logits = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.clip_dense_logits,
+        )
+        if clip_dense_logits is not None:
+            clip_dense_logits = self._ensure_4d_map(
+                clip_dense_logits,
+                OUTPUT_KEYS.clip_dense_logits,
+            )
+            self._validate_same_shape(
+                semantic_logits,
+                clip_dense_logits,
+                OUTPUT_KEYS.semantic_logits,
+                OUTPUT_KEYS.clip_dense_logits,
+            )
+            outputs[OUTPUT_KEYS.clip_dense_logits] = clip_dense_logits
+
+        class_query = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.class_query,
+        )
+        if class_query is not None:
+            class_query = self._ensure_3d_query(
+                class_query,
+                OUTPUT_KEYS.class_query,
+            )
+            self._validate_query_shape(
+                class_query=class_query,
+                semantic_logits=semantic_logits,
+            )
+            outputs[OUTPUT_KEYS.class_query] = class_query
+
+        extra_token_aux_logits = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.extra_token_aux_logits,
+        )
+        if extra_token_aux_logits is not None:
+            outputs[OUTPUT_KEYS.extra_token_aux_logits] = self._ensure_4d_map(
+                extra_token_aux_logits,
+                OUTPUT_KEYS.extra_token_aux_logits,
+            )
+
+        return outputs
 
     def forward(
         self,
         raw_outputs: Dict[str, torch.Tensor],
         batch: BatchedDatapoint,
         expected_num_classes: Optional[int] = None,
-        output_mode: str = "both",
-    ) -> Dict[str, Dict[str, torch.Tensor]] | Dict[str, torch.Tensor]:
+        output_mode: str = "train",
+    ) -> Dict[str, torch.Tensor]:
         output_mode = str(output_mode)
 
         if output_mode == "train":
-            return self._build_train_outputs(
+            return self._build_chunk_train_outputs(
                 raw_outputs=raw_outputs,
                 batch=batch,
                 expected_num_classes=expected_num_classes,
             )
 
-        if output_mode == "infer":
-            return self._build_inference_outputs(
+        if output_mode in {"final", "infer"}:
+            return self._build_final_outputs(
                 raw_outputs=raw_outputs,
                 batch=batch,
                 expected_num_classes=expected_num_classes,
             )
-
-        if output_mode == "both":
-            train_outputs = self._build_train_outputs(
-                raw_outputs=raw_outputs,
-                batch=batch,
-                expected_num_classes=expected_num_classes,
-            )
-
-            inference_outputs = self._build_inference_outputs(
-                raw_outputs=raw_outputs,
-                batch=batch,
-                expected_num_classes=expected_num_classes,
-            )
-
-            return {
-                "train_outputs": train_outputs,
-                "inference_outputs": inference_outputs,
-            }
 
         raise ValueError(
             f"Unknown output_mode={output_mode}. "
-            "Supported modes are: 'train', 'infer', 'both'."
+            "Supported modes are: 'train', 'final', 'infer'."
         )
 
 
@@ -310,7 +314,7 @@ class HybridSegAdapter(nn.Module):
         raw_outputs: Dict[str, torch.Tensor],
         batch: BatchedDatapoint,
         expected_num_classes: Optional[int] = None,
-        output_mode: str = "both",
+        output_mode: str = "train",
     ):
         raise NotImplementedError(
             "HybridSegAdapter is not implemented yet."

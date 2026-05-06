@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from .data_misc import BatchedDatapoint
 from .sam3_image import Sam3Image
-from .task_modes import normalize_task_mode
+from .task_modes import OUTPUT_KEYS, normalize_task_mode
 
 
 class SAM3Segmentor(nn.Module):
@@ -41,6 +41,39 @@ class SAM3Segmentor(nn.Module):
             force=force,
         )
 
+    @staticmethod
+    def _build_mixer_cache_item(
+        outputs: Dict[str, torch.Tensor],
+        chunk_class_ids: List[int],
+        detach_score_maps: bool,
+    ) -> Dict[str, torch.Tensor | list[int]]:
+        required_keys = (
+            OUTPUT_KEYS.semantic_logits,
+            OUTPUT_KEYS.clip_dense_logits,
+            OUTPUT_KEYS.class_query,
+        )
+
+        for key in required_keys:
+            if key not in outputs:
+                raise ValueError(
+                    f"Chunk outputs must contain '{key}' for final mixer."
+                )
+
+        semantic_logits = outputs[OUTPUT_KEYS.semantic_logits]
+        clip_dense_logits = outputs[OUTPUT_KEYS.clip_dense_logits]
+        class_query = outputs[OUTPUT_KEYS.class_query]
+
+        if detach_score_maps:
+            semantic_logits = semantic_logits.detach()
+            clip_dense_logits = clip_dense_logits.detach()
+
+        return {
+            OUTPUT_KEYS.semantic_logits: semantic_logits,
+            OUTPUT_KEYS.clip_dense_logits: clip_dense_logits,
+            OUTPUT_KEYS.class_query: class_query,
+            "chunk_class_ids": list(chunk_class_ids),
+        }
+
     def iter_chunk_outputs(
         self,
         batch: BatchedDatapoint,
@@ -65,12 +98,57 @@ class SAM3Segmentor(nn.Module):
                 "train_outputs": train_outputs,
             }
 
+    def run_final_mixer_from_chunks(
+        self,
+        mixer_cache: List[Dict[str, torch.Tensor | list[int]]],
+        batch: Optional[BatchedDatapoint] = None,
+    ) -> Dict[str, torch.Tensor]:
+        return self.core.run_final_mixer_from_chunks(
+            mixer_cache=mixer_cache,
+            batch=batch,
+        )
+
     def forward(self, batch: BatchedDatapoint) -> dict[str, torch.Tensor]:
-        raw_outputs = self.core(batch)
-        final_outputs = self.adapter(
-            raw_outputs=raw_outputs,
+        mixer_cache = []
+        extra_token_aux_chunks = []
+
+        for chunk in self.core.iter_chunk_raw_outputs(batch):
+            raw_outputs = chunk["raw_outputs"]
+
+            chunk_outputs = self.adapter(
+                raw_outputs=raw_outputs,
+                batch=batch,
+                expected_num_classes=len(chunk["chunk_class_ids"]),
+                output_mode="train",
+            )
+
+            mixer_cache.append(
+                self._build_mixer_cache_item(
+                    outputs=chunk_outputs,
+                    chunk_class_ids=chunk["chunk_class_ids"],
+                    detach_score_maps=False,
+                )
+            )
+
+            if OUTPUT_KEYS.extra_token_aux_logits in chunk_outputs:
+                extra_token_aux_chunks.append(
+                    chunk_outputs[OUTPUT_KEYS.extra_token_aux_logits]
+                )
+
+        final_raw_outputs = self.run_final_mixer_from_chunks(
+            mixer_cache=mixer_cache,
+            batch=batch,
+        )
+
+        if len(extra_token_aux_chunks) > 0:
+            final_raw_outputs[OUTPUT_KEYS.extra_token_aux_logits] = torch.cat(
+                extra_token_aux_chunks,
+                dim=1,
+            )
+
+        return self.adapter(
+            raw_outputs=final_raw_outputs,
             batch=batch,
             expected_num_classes=None,
             output_mode="infer",
         )
-        return final_outputs

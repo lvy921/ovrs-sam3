@@ -109,6 +109,16 @@ class OpenCLIPConfig:
     num_extra_tokens: int = 2
     normalize_label_for_clip: bool = True
 
+@dataclass
+class FinalMixerConfig:
+    enabled: bool = True
+    hidden_dim: int = 128
+    num_heads: int = 8
+    dropout: float = 0.1
+    gate_bias_init: float = 3.0
+
+    class_attn_heads: int = 4
+    class_attn_pooling_size: int = 2
 
 @dataclass
 class CriterionConfig:
@@ -116,7 +126,7 @@ class CriterionConfig:
 
     bce_weight: float = 1.0
     dice_weight: float = 1.0
-    presence_bce_weight: float = 1.0
+
     final_bce_weight: float = 0.4
     final_dice_weight: float = 0.5
     final_ce_weight: float = 1.0
@@ -129,16 +139,16 @@ class CriterionConfig:
     extra_token_aux_exclude_bg: bool = True
     extra_token_aux_bg_idx: int = 0
 
+    suppression_absent_loss_weight: float = 0.05
+    suppression_absent_topk_ratio: float = 0.05
+
     bce_class_balance_clamp_min: float = 0.2
     bce_class_balance_clamp_max: float = 5.0
     eps: float = 1e-6
 
-    presence_pos_weight: float = 1.0
-
 @dataclass
 class AdapterConfig:
-    presence_base: float = 0.5
-    init_presence_modulation_alpha: float = 1.0
+    pass
 
 @dataclass
 class SegmentorBuildConfig:
@@ -155,6 +165,7 @@ class SegmentorBuildConfig:
 
     freeze_cfg: FreezeConfig = field(default_factory=FreezeConfig)
     openclip_cfg: OpenCLIPConfig = field(default_factory=OpenCLIPConfig)
+    final_mixer_cfg: FinalMixerConfig = field(default_factory=FinalMixerConfig)
     criterion_cfg: CriterionConfig = field(default_factory=CriterionConfig)
     adapter_cfg: AdapterConfig = field(default_factory=AdapterConfig)
 
@@ -399,6 +410,16 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         raise TypeError(f"Unsupported openclip_cfg type: {type(obj)}")
 
     @staticmethod
+    def _coerce_final_mixer_cfg(obj) -> FinalMixerConfig:
+        if isinstance(obj, FinalMixerConfig):
+            return obj
+        if obj is None:
+            return FinalMixerConfig()
+        if isinstance(obj, dict):
+            return FinalMixerConfig(**dict(obj))
+        raise TypeError(f"Unsupported final_mixer_cfg type: {type(obj)}")
+
+    @staticmethod
     def _coerce_criterion_cfg(obj) -> CriterionConfig:
         if isinstance(obj, CriterionConfig):
             return obj
@@ -422,6 +443,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
     def _normalize_build_cfg(cls, cfg: SegmentorBuildConfig) -> SegmentorBuildConfig:
         cfg.task_mode = normalize_task_mode(cfg.task_mode)
         cfg.openclip_cfg = cls._coerce_openclip_cfg(cfg.openclip_cfg)
+        cfg.final_mixer_cfg = cls._coerce_final_mixer_cfg(cfg.final_mixer_cfg)
         cfg.criterion_cfg = cls._coerce_criterion_cfg(cfg.criterion_cfg)
         cfg.adapter_cfg = cls._coerce_adapter_cfg(cfg.adapter_cfg)
         return cfg
@@ -589,6 +611,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
             clip_image_encoder=clip_image_encoder,
             clip_text_encoder=clip_text_encoder,
             openclip_cfg=openclip_cfg_for_model,
+            final_mixer_cfg=cfg.final_mixer_cfg,
             task_mode=TASK_MODE_SEMANTIC,
         )
 
@@ -606,12 +629,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         cfg = cls._normalize_build_cfg(cfg)
 
         if cfg.task_mode == TASK_MODE_SEMANTIC:
-            return SemanticSegAdapter(
-                presence_base=float(cfg.adapter_cfg.presence_base),
-                init_presence_modulation_alpha=float(
-                    cfg.adapter_cfg.init_presence_modulation_alpha
-                ),
-            )
+            return SemanticSegAdapter()
 
         if cfg.task_mode == TASK_MODE_HYBRID:
             return HybridSegAdapter()
@@ -625,9 +643,10 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         if cfg.task_mode == TASK_MODE_SEMANTIC:
             criterion_cfg = SemanticCriterionConfig(
                 ignore_index=int(cfg.criterion_cfg.ignore_index),
+
                 bce_weight=float(cfg.criterion_cfg.bce_weight),
                 dice_weight=float(cfg.criterion_cfg.dice_weight),
-                presence_bce_weight=float(cfg.criterion_cfg.presence_bce_weight),
+
                 final_bce_weight=float(cfg.criterion_cfg.final_bce_weight),
                 final_dice_weight=float(cfg.criterion_cfg.final_dice_weight),
                 final_ce_weight=float(cfg.criterion_cfg.final_ce_weight),
@@ -654,6 +673,13 @@ class SAM3ModelBuilder(FrozenModuleMixin):
                     cfg.criterion_cfg.extra_token_aux_bg_idx
                 ),
 
+                suppression_absent_loss_weight=float(
+                    cfg.criterion_cfg.suppression_absent_loss_weight
+                ),
+                suppression_absent_topk_ratio=float(
+                    cfg.criterion_cfg.suppression_absent_topk_ratio
+                ),
+
                 bce_class_balance_clamp_min=float(
                     cfg.criterion_cfg.bce_class_balance_clamp_min
                 ),
@@ -661,7 +687,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
                     cfg.criterion_cfg.bce_class_balance_clamp_max
                 ),
                 eps=float(cfg.criterion_cfg.eps),
-                presence_pos_weight=float(cfg.criterion_cfg.presence_pos_weight),
             )
             return SemanticCriterion(cfg=criterion_cfg)
 

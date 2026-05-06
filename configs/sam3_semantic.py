@@ -35,64 +35,64 @@ model = dict(
         normalize_label_for_clip=True,
     ),
 
+    final_mixer_cfg=dict(
+        enabled=True,
+        hidden_dim=128,
+        num_heads=8,
+        dropout=0.1,
+        gate_bias_init=3.0,
+
+        class_attn_heads=4,
+        class_attn_pooling_size=2,
+    ),
+
     freeze_cfg=dict(
         train_adapters_only=True,
         trainable_modules=[
-            # CLIP native image -> CLIP text attention
             "core.clip_native_image_to_text_attn",
             "core.clip_native_image_to_text_norm",
 
-            # CLIP native space -> SAM3 hidden dim
             "core.clip_hv_proj",
 
-            # SAM3 text -> CLIP-enhanced image-token attention
             "core.sam3_to_clip_hv_attn",
             "core.sam3_to_clip_hv_norm",
 
-            # distinguish extra tokens from original SAM3 text tokens
             "core.extra_type_embed",
 
-            # extra token auxiliary mask head
             "core.extra_token_mask_query_proj",
             "core.extra_token_mask_memory_proj",
             "core.extra_token_logit_scale",
 
-            # new presence seed
-            "core.presence_seed_proj",
+            "core.class_query_seed_proj",
+            "core.class_query_encoder_cross_attn",
+            "core.class_query_encoder_cross_attn_norm",
+            "core.class_query_proj",
 
-            # presence branch
-            "core.presence_cross_attn",
-            "core.presence_cross_attn_norm",
-            "core.presence_head",
+            "core.class_query_self_attn",
+            "core.class_query_self_attn_norm",
 
-            # final logits modulation
-            "adapter.presence_modulation_alpha",
+            "core.score_fusion_block",
+
+            "core.suppression_query_cross_attn",
+            "core.suppression_query_cross_attn_norm",
+            "core.suppression_logit_scale",
+            "core.suppression_gate_bias",
         ],
         frozen_modules=[],
     ),
 
-    adapter_cfg=dict(
-        presence_base=0.1,
-        init_presence_modulation_alpha=1.0,
-    ),
+    adapter_cfg=dict(),
 
     criterion_cfg=dict(
         ignore_index=255,
 
-        # original semantic mask supervision
         bce_weight=0.4,
         dice_weight=1.0,
 
-        # weakened presence supervision
-        presence_bce_weight=0.2,
-        presence_pos_weight=1.0,
-
-        # final score map supervision
         final_bce_weight=0.1,
-        final_dice_weight=0.1,
+        final_dice_weight=0.5,
         final_ce_weight=0.1,
 
-        # extra token auxiliary supervision
         extra_token_aux_loss_weight=0.1,
         extra_token_aux_bce_weight=0.3,
         extra_token_aux_dice_weight=0.3,
@@ -101,7 +101,9 @@ model = dict(
         extra_token_aux_exclude_bg=False,
         extra_token_aux_bg_idx=0,
 
-        # other loss hyper-parameters
+        suppression_absent_loss_weight=0.5,
+        suppression_absent_topk_ratio=0.05,
+
         bce_class_balance_clamp_min=0.2,
         bce_class_balance_clamp_max=5.0,
         eps=1e-6,
@@ -109,7 +111,7 @@ model = dict(
 )
 
 train_dataloader = dict(
-    batch_size=4,
+    batch_size=2,
     num_workers=8,
 )
 
@@ -134,31 +136,33 @@ optim_wrapper = dict(
         paramwise_cfg=dict(
             norm_decay_mult=0.0,
             custom_keys={
-                # -------- CLIP native image -> text attention --------
                 "core.clip_native_image_to_text_attn": dict(lr_mult=2.0, decay_mult=1.0),
                 "core.clip_native_image_to_text_norm": dict(lr_mult=2.0, decay_mult=0.0),
 
-                # -------- CLIP hidden visual tokens -> SAM3 hidden dim --------
                 "core.clip_hv_proj": dict(lr_mult=2.0, decay_mult=1.0),
 
-                # -------- SAM3 text token attends to CLIP-enhanced visual tokens --------
                 "core.sam3_to_clip_hv_attn": dict(lr_mult=2.0, decay_mult=1.0),
                 "core.sam3_to_clip_hv_norm": dict(lr_mult=2.0, decay_mult=0.0),
 
-                # -------- extra token identity and auxiliary mask head --------
                 "core.extra_type_embed": dict(lr_mult=2.0, decay_mult=0.0),
                 "core.extra_token_mask_query_proj": dict(lr_mult=3.0, decay_mult=1.0),
                 "core.extra_token_mask_memory_proj": dict(lr_mult=3.0, decay_mult=1.0),
                 "core.extra_token_logit_scale": dict(lr_mult=1.0, decay_mult=0.0),
 
-                # -------- presence branch, keep moderate --------
-                "core.presence_seed_proj": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.presence_cross_attn": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.presence_cross_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
-                "core.presence_head": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.class_query_seed_proj": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.class_query_encoder_cross_attn": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.class_query_encoder_cross_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
+                "core.class_query_proj": dict(lr_mult=2.0, decay_mult=1.0),
 
-                # -------- final logits modulation --------
-                "adapter.presence_modulation_alpha": dict(lr_mult=1.0, decay_mult=0.0),
+                "core.class_query_self_attn": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.class_query_self_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
+
+                "core.score_fusion_block": dict(lr_mult=2.0, decay_mult=1.0),
+
+                "core.suppression_query_cross_attn": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.suppression_query_cross_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
+                "core.suppression_logit_scale": dict(lr_mult=1.0, decay_mult=0.0),
+                "core.suppression_gate_bias": dict(lr_mult=1.0, decay_mult=0.0),
             }
         ),
     )

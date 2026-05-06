@@ -25,11 +25,13 @@ class VisualizerConfig:
     save_ground_truth: bool = True
     save_semantic_prediction: bool = True
 
-    save_presence_summary: bool = True
+    save_score_summary: bool = True
     save_score_heatmaps: bool = True
+    save_suppression_heatmaps: bool = True
+    save_extra_token_aux_heatmaps: bool = True
+    heatmap_colormap: str = "turbo"
 
     save_clip_argmax_prediction: bool = True
-
     save_clip_score_heatmaps: bool = True
 
     vis_prob: float = 0.05
@@ -147,8 +149,8 @@ class BaseSemanticOverlayTask(VisualizationTask):
                         f.write(f"{i}\t{name}\n")
 
 
-class PresenceAnalysisTask(VisualizationTask):
-    name = "presence_analysis"
+class BranchScoreAnalysisTask(VisualizationTask):
+    name = "branch_score_analysis"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
         outputs = ctx.semantic_outputs
@@ -156,40 +158,64 @@ class PresenceAnalysisTask(VisualizationTask):
 
         semantic_score_map = outputs.get(OUTPUT_KEYS.semantic_score_map, None)
         final_score_map = outputs.get(OUTPUT_KEYS.final_score_map, None)
-        presence_score = outputs.get(OUTPUT_KEYS.presence_score, None)
 
         if semantic_score_map is None:
-            raise ValueError(f"outputs must contain '{OUTPUT_KEYS.semantic_score_map}'.")
+            semantic_logits = outputs.get(OUTPUT_KEYS.semantic_logits, None)
+            if semantic_logits is not None:
+                semantic_score_map = semantic_logits.sigmoid()
+
         if final_score_map is None:
-            raise ValueError(f"outputs must contain '{OUTPUT_KEYS.final_score_map}'.")
-        if presence_score is None:
-            raise ValueError(f"outputs must contain '{OUTPUT_KEYS.presence_score}'.")
+            final_logits = outputs.get(OUTPUT_KEYS.final_logits, None)
+            if final_logits is not None:
+                final_score_map = final_logits.sigmoid()
+
+        suppression_logits = outputs.get(OUTPUT_KEYS.suppression_logits, None)
+        extra_token_aux_logits = outputs.get(OUTPUT_KEYS.extra_token_aux_logits, None)
+
+        if semantic_score_map is None:
+            raise ValueError(
+                f"outputs must contain '{OUTPUT_KEYS.semantic_score_map}' "
+                f"or '{OUTPUT_KEYS.semantic_logits}'."
+            )
+        if final_score_map is None:
+            raise ValueError(
+                f"outputs must contain '{OUTPUT_KEYS.final_score_map}' "
+                f"or '{OUTPUT_KEYS.final_logits}'."
+            )
 
         if semantic_score_map.dim() != 4:
             raise ValueError(
-                f"Expected semantic_score_map as [B, C, H, W], got {tuple(semantic_score_map.shape)}"
+                f"Expected semantic_score_map as [B, C, H, W], "
+                f"got {tuple(semantic_score_map.shape)}."
             )
         if final_score_map.dim() != 4:
             raise ValueError(
-                f"Expected final_score_map as [B, C, H, W], got {tuple(final_score_map.shape)}"
+                f"Expected final_score_map as [B, C, H, W], "
+                f"got {tuple(final_score_map.shape)}."
             )
-        if presence_score.dim() != 2:
-            raise ValueError(
-                f"Expected presence_score as [B, C], got {tuple(presence_score.shape)}"
-            )
-
         if semantic_score_map.shape != final_score_map.shape:
             raise ValueError(
-                f"semantic_score_map and final_score_map shape mismatch: "
-                f"{tuple(semantic_score_map.shape)} vs {tuple(final_score_map.shape)}"
-            )
-        if semantic_score_map.shape[:2] != presence_score.shape:
-            raise ValueError(
-                f"semantic_score_map and presence_score shape mismatch: "
-                f"{tuple(semantic_score_map.shape[:2])} vs {tuple(presence_score.shape)}"
+                "semantic_score_map and final_score_map shape mismatch: "
+                f"{tuple(semantic_score_map.shape)} vs {tuple(final_score_map.shape)}."
             )
 
-        class_names = None
+        for key, value in (
+            (OUTPUT_KEYS.suppression_logits, suppression_logits),
+            (OUTPUT_KEYS.extra_token_aux_logits, extra_token_aux_logits),
+        ):
+            if value is None:
+                continue
+            if value.dim() != 4:
+                raise ValueError(
+                    f"Expected {key} as [B, C, H, W], got {tuple(value.shape)}."
+                )
+            if value.shape[:2] != semantic_score_map.shape[:2]:
+                raise ValueError(
+                    f"{key} batch/class shape mismatch: "
+                    f"{tuple(value.shape[:2])} vs "
+                    f"{tuple(semantic_score_map.shape[:2])}."
+                )
+
         try:
             class_names = [str(x) for x in batch.find_metadatas[0].class_names]
         except Exception:
@@ -206,19 +232,23 @@ class PresenceAnalysisTask(VisualizationTask):
             overlay_image = manager._extract_overlay_image(batch, b)
             out_hw = overlay_image.size[::-1]
 
-            semantic_scores_b = semantic_score_map[b]  # [C, H, W]
-            final_scores_b = final_score_map[b]        # [C, H, W]
-            presence_scores_b = presence_score[b]      # [C]
+            semantic_scores_b = semantic_score_map[b]
+            final_scores_b = final_score_map[b]
 
-            semantic_max = semantic_scores_b.flatten(1).max(dim=1).values  # [C]
-            final_max = final_scores_b.flatten(1).max(dim=1).values        # [C]
+            suppression_logits_b = (
+                suppression_logits[b] if suppression_logits is not None else None
+            )
+            extra_token_aux_logits_b = (
+                extra_token_aux_logits[b] if extra_token_aux_logits is not None else None
+            )
 
-            if manager.cfg.save_presence_summary:
-                manager._save_presence_summary(
+            if manager.cfg.save_score_summary:
+                manager._save_score_summary(
                     sample_dir=sample_dir,
-                    presence_score=presence_scores_b,
-                    semantic_max=semantic_max,
-                    final_max=final_max,
+                    semantic_scores=semantic_scores_b,
+                    final_scores=final_scores_b,
+                    suppression_logits=suppression_logits_b,
+                    extra_token_aux_logits=extra_token_aux_logits_b,
                     class_names=class_names,
                 )
 
@@ -227,7 +257,8 @@ class PresenceAnalysisTask(VisualizationTask):
                     sample_dir=sample_dir,
                     semantic_scores=semantic_scores_b,
                     final_scores=final_scores_b,
-                    presence_scores=presence_scores_b,
+                    suppression_logits=suppression_logits_b,
+                    extra_token_aux_logits=extra_token_aux_logits_b,
                     out_hw=out_hw,
                     class_names=class_names,
                 )
@@ -242,16 +273,6 @@ class ClipImageTextScoreTask(VisualizationTask):
         ):
             return
 
-        outputs = ctx.semantic_outputs
-        presence_score = outputs.get(OUTPUT_KEYS.presence_score, None)
-        if presence_score is None:
-            return
-
-        if presence_score.dim() != 2:
-            raise ValueError(
-                f"Expected presence_score as [B, C], got {tuple(presence_score.shape)}"
-            )
-
         clip_score_map = manager._build_clip_image_text_score_map_for_visualization(
             model=ctx.model,
             batch=ctx.batch,
@@ -261,14 +282,8 @@ class ClipImageTextScoreTask(VisualizationTask):
 
         if clip_score_map.dim() != 4:
             raise ValueError(
-                f"Expected clip_score_map as [B, C, Hc, Wc], got {tuple(clip_score_map.shape)}"
-            )
-
-        if clip_score_map.shape[:2] != presence_score.shape:
-            raise ValueError(
-                "Shape mismatch between clip_score_map and presence_score: "
-                f"clip_score_map.shape[:2]={tuple(clip_score_map.shape[:2])}, "
-                f"presence_score.shape={tuple(presence_score.shape)}"
+                f"Expected clip_score_map as [B, C, Hc, Wc], "
+                f"got {tuple(clip_score_map.shape)}."
             )
 
         try:
@@ -294,9 +309,7 @@ class ClipImageTextScoreTask(VisualizationTask):
                 size=out_hw,
                 mode="bilinear",
                 align_corners=False,
-            )[0]  # [C, H, W]
-
-            presence_scores_b = presence_score[b]  # [C]
+            )[0]
 
             if manager.cfg.save_clip_argmax_prediction:
                 clip_pred = clip_score_up.argmax(dim=0).long()
@@ -316,7 +329,6 @@ class ClipImageTextScoreTask(VisualizationTask):
                 manager._save_clip_score_heatmaps(
                     sample_dir=sample_dir,
                     clip_scores=clip_score_up,
-                    presence_scores=presence_scores_b,
                     out_hw=out_hw,
                     class_names=class_names,
                 )
@@ -332,7 +344,7 @@ class VisualizationManager:
     def _build_tasks(self):
         return [
             BaseSemanticOverlayTask(),
-            PresenceAnalysisTask(),
+            BranchScoreAnalysisTask(),
             ClipImageTextScoreTask(),
         ]
 
@@ -503,32 +515,6 @@ class VisualizationManager:
         raise TypeError(f"Unsupported image type: {type(image)}")
 
     @staticmethod
-    def _to_normalized_heatmap_image(score_map: torch.Tensor, out_hw: Tuple[int, int]) -> Image.Image:
-        x = score_map.detach().cpu().float()
-        if x.dim() == 3:
-            if x.shape[0] != 1:
-                raise ValueError(f"Expected [1,H,W] or [H,W], got {tuple(x.shape)}")
-            x = x[0]
-        if x.dim() != 2:
-            raise ValueError(f"Expected [H,W], got {tuple(x.shape)}")
-
-        if tuple(x.shape[-2:]) != tuple(out_hw):
-            x = F.interpolate(
-                x[None, None],
-                size=out_hw,
-                mode="bilinear",
-                align_corners=False,
-            )[0, 0]
-
-        x_min = x.min()
-        x_max = x.max()
-        x = (x - x_min) / (x_max - x_min).clamp_min(1e-6)
-
-        arr = (x.numpy() * 255.0).astype(np.uint8)
-        heat = np.stack([arr, arr, arr], axis=-1)
-        return Image.fromarray(heat, mode="RGB")
-
-    @staticmethod
     def _extract_overlay_image(batch: Any, batch_index: int) -> Image.Image:
         raw_images = getattr(batch, "raw_images", None)
         if raw_images is not None and batch_index < len(raw_images) and raw_images[batch_index] is not None:
@@ -667,22 +653,126 @@ class VisualizationManager:
         return logits.argmax(dim=1)
 
     @staticmethod
-    def _to_heatmap_image(score_map: torch.Tensor, out_hw: Tuple[int, int]) -> Image.Image:
+    def _apply_turbo_colormap(x: np.ndarray) -> np.ndarray:
+        x = np.clip(x.astype(np.float32), 0.0, 1.0)
+
+        coeffs = np.array(
+            [
+                [0.13572138, 4.61539260, -42.66032258, 132.13108234, -152.94239396, 59.28637943],
+                [0.09140261, 2.19418839, 4.84296658, -14.18503333, 4.27729857, 2.82956604],
+                [0.10667330, 12.64194608, -60.58204836, 110.36276771, -89.90310912, 27.34824973],
+            ],
+            dtype=np.float32,
+        )
+
+        powers = np.stack(
+            [
+                np.ones_like(x),
+                x,
+                x ** 2,
+                x ** 3,
+                x ** 4,
+                x ** 5,
+            ],
+            axis=-1,
+        )
+
+        rgb = powers @ coeffs.T
+        rgb = np.clip(rgb, 0.0, 1.0)
+        return (rgb * 255.0).astype(np.uint8)
+
+    @staticmethod
+    def _apply_gray_colormap(x: np.ndarray) -> np.ndarray:
+        x = np.clip(x.astype(np.float32), 0.0, 1.0)
+        arr = (x * 255.0).astype(np.uint8)
+        return np.stack([arr, arr, arr], axis=-1)
+
+    def _apply_colormap(self, x: np.ndarray) -> np.ndarray:
+        name = str(getattr(self.cfg, "heatmap_colormap", "turbo")).lower()
+
+        if name == "turbo":
+            return self._apply_turbo_colormap(x)
+
+        if name in {"gray", "grey", "grayscale"}:
+            return self._apply_gray_colormap(x)
+
+        raise ValueError(
+            f"Unsupported heatmap_colormap={name!r}. "
+            "Supported values are: 'turbo', 'gray'."
+        )
+
+    @staticmethod
+    def _normalize_heatmap_values(
+            x: torch.Tensor,
+            normalize: str,
+    ) -> torch.Tensor:
+        normalize = str(normalize)
+
+        if normalize == "prob":
+            return x.clamp(0.0, 1.0)
+
+        if normalize == "sigmoid":
+            return x.sigmoid()
+
+        if normalize == "minmax":
+            x_min = x.min()
+            x_max = x.max()
+            return (x - x_min) / (x_max - x_min).clamp_min(1e-6)
+
+        if normalize == "auto":
+            x_min = x.min()
+            x_max = x.max()
+
+            if float(x_min.item()) >= 0.0 and float(x_max.item()) <= 1.0:
+                return x.clamp(0.0, 1.0)
+
+            return (x - x_min) / (x_max - x_min).clamp_min(1e-6)
+
+        raise ValueError(
+            f"Unknown heatmap normalize mode={normalize!r}. "
+            "Supported modes are: 'auto', 'prob', 'sigmoid', 'minmax'."
+        )
+
+    def _to_heatmap_image(
+            self,
+            score_map: torch.Tensor,
+            out_hw: Tuple[int, int],
+            normalize: str = "auto",
+    ) -> Image.Image:
         x = score_map.detach().cpu().float()
+
         if x.dim() == 3:
             if x.shape[0] != 1:
-                raise ValueError(f"Expected [1,H,W] or [H,W], got {tuple(x.shape)}")
+                raise ValueError(f"Expected [1, H, W] or [H, W], got {tuple(x.shape)}.")
             x = x[0]
+
         if x.dim() != 2:
-            raise ValueError(f"Expected [H,W], got {tuple(x.shape)}")
+            raise ValueError(f"Expected [H, W], got {tuple(x.shape)}.")
 
         if tuple(x.shape[-2:]) != tuple(out_hw):
-            x = F.interpolate(x[None, None], size=out_hw, mode="bilinear", align_corners=False)[0, 0]
+            x = F.interpolate(
+                x[None, None],
+                size=out_hw,
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0]
 
-        x = x.clamp(0.0, 1.0)
-        arr = (x.numpy() * 255.0).astype(np.uint8)
-        heat = np.stack([arr, arr, arr], axis=-1)
+        x = self._normalize_heatmap_values(x, normalize=normalize)
+
+        arr = x.numpy()
+        heat = self._apply_colormap(arr)
         return Image.fromarray(heat, mode="RGB")
+
+    def _to_normalized_heatmap_image(
+            self,
+            score_map: torch.Tensor,
+            out_hw: Tuple[int, int],
+    ) -> Image.Image:
+        return self._to_heatmap_image(
+            score_map=score_map,
+            out_hw=out_hw,
+            normalize="minmax",
+        )
 
     @staticmethod
     def _sanitize_filename(text: str) -> str:
@@ -695,39 +785,106 @@ class VisualizationManager:
         value = "".join(safe).strip("_")
         return value or "class"
 
-    def _save_presence_summary(
-        self,
-        sample_dir: Path,
-        presence_score: torch.Tensor,
-        semantic_max: torch.Tensor,
-        final_max: torch.Tensor,
-        class_names: Optional[List[str]],
-    ) -> None:
-        if presence_score.dim() != 1:
-            raise ValueError(f"Expected presence_score as [C], got {tuple(presence_score.shape)}")
-        if semantic_max.dim() != 1:
-            raise ValueError(f"Expected semantic_max as [C], got {tuple(semantic_max.shape)}")
-        if final_max.dim() != 1:
-            raise ValueError(f"Expected final_max as [C], got {tuple(final_max.shape)}")
+    @staticmethod
+    def _format_optional_float(value: Optional[float]) -> str:
+        if value is None:
+            return "nan"
+        return f"{float(value):.6f}"
 
-        num_classes = int(presence_score.shape[0])
-        if semantic_max.shape[0] != num_classes or final_max.shape[0] != num_classes:
+    @staticmethod
+    def _per_class_max_mean(
+            score_map: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if score_map is None:
+            return None, None
+
+        if score_map.dim() != 3:
             raise ValueError(
-                f"Class count mismatch in presence summary: "
-                f"{num_classes}, {semantic_max.shape[0]}, {final_max.shape[0]}"
+                f"Expected score_map as [C, H, W], got {tuple(score_map.shape)}."
             )
 
-        order = torch.argsort(presence_score, descending=True)
+        flat = score_map.flatten(1)
+        return flat.max(dim=1).values, flat.mean(dim=1)
 
-        with open(sample_dir / "presence_summary.txt", "w", encoding="utf-8") as f:
-            f.write("rank\tclass_id\tclass_name\tpresence_score\tsemantic_max\tfinal_max\n")
+    def _save_score_summary(
+            self,
+            sample_dir: Path,
+            semantic_scores: torch.Tensor,
+            final_scores: torch.Tensor,
+            suppression_logits: Optional[torch.Tensor],
+            extra_token_aux_logits: Optional[torch.Tensor],
+            class_names: Optional[List[str]],
+    ) -> None:
+        if semantic_scores.dim() != 3:
+            raise ValueError(
+                f"Expected semantic_scores as [C, H, W], got {tuple(semantic_scores.shape)}."
+            )
+        if final_scores.dim() != 3:
+            raise ValueError(
+                f"Expected final_scores as [C, H, W], got {tuple(final_scores.shape)}."
+            )
+
+        num_classes = int(semantic_scores.shape[0])
+        if final_scores.shape[0] != num_classes:
+            raise ValueError(
+                f"Class count mismatch: semantic={num_classes}, final={final_scores.shape[0]}."
+            )
+
+        semantic_max, semantic_mean = self._per_class_max_mean(semantic_scores)
+        final_max, final_mean = self._per_class_max_mean(final_scores)
+
+        suppression_max, suppression_mean = self._per_class_max_mean(suppression_logits)
+        extra_aux_max, extra_aux_mean = self._per_class_max_mean(extra_token_aux_logits)
+
+        order = torch.argsort(final_max, descending=True)
+
+        with open(sample_dir / "branch_score_summary.txt", "w", encoding="utf-8") as f:
+            f.write(
+                "rank\tclass_id\tclass_name\t"
+                "semantic_max\tsemantic_mean\t"
+                "final_max\tfinal_mean\t"
+                "suppression_logit_max\tsuppression_logit_mean\t"
+                "extra_token_aux_logit_max\textra_token_aux_logit_mean\n"
+            )
+
             for rank, cls_idx in enumerate(order.tolist()):
-                class_name = class_names[cls_idx] if class_names is not None and cls_idx < len(class_names) else f"class_{cls_idx}"
+                class_name = (
+                    class_names[cls_idx]
+                    if class_names is not None and cls_idx < len(class_names)
+                    else f"class_{cls_idx}"
+                )
+
+                suppression_max_value = (
+                    float(suppression_max[cls_idx].item())
+                    if suppression_max is not None
+                    else None
+                )
+                suppression_mean_value = (
+                    float(suppression_mean[cls_idx].item())
+                    if suppression_mean is not None
+                    else None
+                )
+                extra_aux_max_value = (
+                    float(extra_aux_max[cls_idx].item())
+                    if extra_aux_max is not None
+                    else None
+                )
+                extra_aux_mean_value = (
+                    float(extra_aux_mean[cls_idx].item())
+                    if extra_aux_mean is not None
+                    else None
+                )
+
                 f.write(
                     f"{rank}\t{cls_idx}\t{class_name}\t"
-                    f"{float(presence_score[cls_idx].item()):.6f}\t"
                     f"{float(semantic_max[cls_idx].item()):.6f}\t"
-                    f"{float(final_max[cls_idx].item()):.6f}\n"
+                    f"{float(semantic_mean[cls_idx].item()):.6f}\t"
+                    f"{float(final_max[cls_idx].item()):.6f}\t"
+                    f"{float(final_mean[cls_idx].item()):.6f}\t"
+                    f"{self._format_optional_float(suppression_max_value)}\t"
+                    f"{self._format_optional_float(suppression_mean_value)}\t"
+                    f"{self._format_optional_float(extra_aux_max_value)}\t"
+                    f"{self._format_optional_float(extra_aux_mean_value)}\n"
                 )
 
     def _save_all_score_heatmaps(
@@ -735,93 +892,148 @@ class VisualizationManager:
             sample_dir: Path,
             semantic_scores: torch.Tensor,
             final_scores: torch.Tensor,
-            presence_scores: torch.Tensor,
+            suppression_logits: Optional[torch.Tensor],
+            extra_token_aux_logits: Optional[torch.Tensor],
             out_hw: Tuple[int, int],
             class_names: Optional[List[str]],
     ) -> None:
         if semantic_scores.dim() != 3:
-            raise ValueError(f"Expected semantic_scores as [C,H,W], got {tuple(semantic_scores.shape)}")
-        if final_scores.dim() != 3:
-            raise ValueError(f"Expected final_scores as [C,H,W], got {tuple(final_scores.shape)}")
-        if presence_scores.dim() != 1:
-            raise ValueError(f"Expected presence_scores as [C], got {tuple(presence_scores.shape)}")
-
-        num_classes = int(semantic_scores.shape[0])
-        if final_scores.shape[0] != num_classes or presence_scores.shape[0] != num_classes:
             raise ValueError(
-                f"Class count mismatch in score heatmaps: "
-                f"{num_classes}, {final_scores.shape[0]}, {presence_scores.shape[0]}"
+                f"Expected semantic_scores as [C, H, W], got {tuple(semantic_scores.shape)}."
+            )
+        if final_scores.dim() != 3:
+            raise ValueError(
+                f"Expected final_scores as [C, H, W], got {tuple(final_scores.shape)}."
             )
 
-        semantic_max = semantic_scores.flatten(1).max(dim=1).values  # [C]
-        final_max = final_scores.flatten(1).max(dim=1).values  # [C]
+        num_classes = int(semantic_scores.shape[0])
+        if final_scores.shape[0] != num_classes:
+            raise ValueError(
+                f"Class count mismatch in score heatmaps: "
+                f"semantic={num_classes}, final={final_scores.shape[0]}."
+            )
 
-        order = torch.argsort(presence_scores, descending=True)
+        for key, value in (
+                ("suppression_logits", suppression_logits),
+                ("extra_token_aux_logits", extra_token_aux_logits),
+        ):
+            if value is None:
+                continue
+            if value.dim() != 3:
+                raise ValueError(
+                    f"Expected {key} as [C, H, W], got {tuple(value.shape)}."
+                )
+            if value.shape[0] != num_classes:
+                raise ValueError(
+                    f"{key} class count mismatch: {value.shape[0]} vs {num_classes}."
+                )
+
+        final_max = final_scores.flatten(1).max(dim=1).values
+        order = torch.argsort(final_max, descending=True)
 
         heatmap_dir = sample_dir / "score_heatmaps"
         heatmap_dir.mkdir(parents=True, exist_ok=True)
 
         with open(heatmap_dir / "all_classes.txt", "w", encoding="utf-8") as f:
-            f.write("rank\tclass_id\tclass_name\tpresence_score\tsemantic_max\tfinal_max\n")
+            f.write(
+                "rank\tclass_id\tclass_name\t"
+                "semantic_max\tfinal_max\t"
+                "has_suppression_logits\thas_extra_token_aux_logits\n"
+            )
+
             for rank, cls_idx in enumerate(order.tolist()):
                 class_name = (
                     class_names[cls_idx]
                     if class_names is not None and cls_idx < len(class_names)
                     else f"class_{cls_idx}"
                 )
+                safe_name = self._sanitize_filename(class_name)
 
-                semantic_max_value = float(semantic_max[cls_idx].item())
-                final_max_value = float(final_max[cls_idx].item())
-                presence_value = float(presence_scores[cls_idx].item())
+                semantic_max_value = float(
+                    semantic_scores[cls_idx].flatten().max().item()
+                )
+                final_max_value = float(
+                    final_scores[cls_idx].flatten().max().item()
+                )
 
                 f.write(
                     f"{rank}\t{cls_idx}\t{class_name}\t"
-                    f"{presence_value:.6f}\t"
                     f"{semantic_max_value:.6f}\t"
-                    f"{final_max_value:.6f}\n"
+                    f"{final_max_value:.6f}\t"
+                    f"{int(suppression_logits is not None)}\t"
+                    f"{int(extra_token_aux_logits is not None)}\n"
                 )
 
-                safe_name = self._sanitize_filename(class_name)
-                semantic_img = self._to_heatmap_image(semantic_scores[cls_idx], out_hw)
-                final_img = self._to_heatmap_image(final_scores[cls_idx], out_hw)
+                semantic_img = self._to_heatmap_image(
+                    semantic_scores[cls_idx],
+                    out_hw=out_hw,
+                    normalize="prob",
+                )
+                final_img = self._to_heatmap_image(
+                    final_scores[cls_idx],
+                    out_hw=out_hw,
+                    normalize="prob",
+                )
 
                 semantic_img.save(
-                    heatmap_dir / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_semantic.png"
+                    heatmap_dir
+                    / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_semantic_score.png"
                 )
                 final_img.save(
-                    heatmap_dir / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_final.png"
+                    heatmap_dir
+                    / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_final_score.png"
                 )
+
+                if (
+                        self.cfg.save_suppression_heatmaps
+                        and suppression_logits is not None
+                ):
+                    suppression_img = self._to_heatmap_image(
+                        suppression_logits[cls_idx],
+                        out_hw=out_hw,
+                        normalize="minmax",
+                    )
+                    suppression_img.save(
+                        heatmap_dir
+                        / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_suppression_logits.png"
+                    )
+
+                if (
+                        self.cfg.save_extra_token_aux_heatmaps
+                        and extra_token_aux_logits is not None
+                ):
+                    extra_aux_img = self._to_heatmap_image(
+                        extra_token_aux_logits[cls_idx],
+                        out_hw=out_hw,
+                        normalize="minmax",
+                    )
+                    extra_aux_img.save(
+                        heatmap_dir
+                        / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_extra_token_aux_logits.png"
+                    )
 
     def _save_clip_score_heatmaps(
             self,
             sample_dir: Path,
             clip_scores: torch.Tensor,
-            presence_scores: torch.Tensor,
             out_hw: Tuple[int, int],
             class_names: Optional[List[str]],
     ) -> None:
         if clip_scores.dim() != 3:
-            raise ValueError(f"Expected clip_scores as [C,H,W], got {tuple(clip_scores.shape)}")
-        if presence_scores.dim() != 1:
-            raise ValueError(f"Expected presence_scores as [C], got {tuple(presence_scores.shape)}")
-
-        num_classes = int(clip_scores.shape[0])
-        if presence_scores.shape[0] != num_classes:
             raise ValueError(
-                "Class count mismatch in CLIP score heatmaps: "
-                f"clip_scores has {num_classes}, presence_scores has {presence_scores.shape[0]}"
+                f"Expected clip_scores as [C, H, W], got {tuple(clip_scores.shape)}."
             )
 
         clip_max = clip_scores.flatten(1).max(dim=1).values
         clip_mean = clip_scores.flatten(1).mean(dim=1)
 
-        order = torch.argsort(presence_scores, descending=True)
+        order = torch.argsort(clip_max, descending=True)
 
         heatmap_dir = sample_dir / "clip_score_heatmaps"
         heatmap_dir.mkdir(parents=True, exist_ok=True)
 
         with open(heatmap_dir / "all_classes.txt", "w", encoding="utf-8") as f:
-            f.write("rank\tclass_id\tclass_name\tpresence_score\tclip_max\tclip_mean\n")
+            f.write("rank\tclass_id\tclass_name\tclip_max\tclip_mean\n")
 
             for rank, cls_idx in enumerate(order.tolist()):
                 class_name = (
@@ -830,25 +1042,25 @@ class VisualizationManager:
                     else f"class_{cls_idx}"
                 )
 
-                presence_value = float(presence_scores[cls_idx].item())
                 clip_max_value = float(clip_max[cls_idx].item())
                 clip_mean_value = float(clip_mean[cls_idx].item())
 
                 f.write(
                     f"{rank}\t{cls_idx}\t{class_name}\t"
-                    f"{presence_value:.6f}\t"
                     f"{clip_max_value:.6f}\t"
                     f"{clip_mean_value:.6f}\n"
                 )
 
                 safe_name = self._sanitize_filename(class_name)
-                clip_img = self._to_normalized_heatmap_image(
-                    clip_scores[cls_idx],
-                    out_hw,
-                )
 
+                clip_img = self._to_heatmap_image(
+                    clip_scores[cls_idx],
+                    out_hw=out_hw,
+                    normalize="minmax",
+                )
                 clip_img.save(
-                    heatmap_dir / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_clip.png"
+                    heatmap_dir
+                    / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_clip_score.png"
                 )
 
     def _get_epoch_key(self, stage: str, epoch: Optional[int]) -> Tuple[str, int]:

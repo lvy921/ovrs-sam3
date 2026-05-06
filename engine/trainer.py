@@ -9,6 +9,7 @@ from typing import Dict, Iterable, Optional, Sequence
 import torch
 from torch.amp import GradScaler, autocast
 
+from ..models.task_modes import OUTPUT_KEYS
 from .checkpoint import CheckpointManager, CheckpointManagerConfig
 from .evaluator import (
     MulticlassSemanticEvaluator,
@@ -195,15 +196,51 @@ class Trainer:
             for key, value in loss_sums.items()
         }
 
+    def _build_final_mixer_cache_item(
+            self,
+            chunk: Dict,
+    ) -> Dict[str, torch.Tensor | list[int]]:
+        train_outputs = chunk["train_outputs"]
+
+        required_keys = (
+            OUTPUT_KEYS.semantic_logits,
+            OUTPUT_KEYS.clip_dense_logits,
+            OUTPUT_KEYS.class_query,
+        )
+        for key in required_keys:
+            if key not in train_outputs:
+                raise ValueError(
+                    f"Chunk train_outputs must contain '{key}' for final mixer."
+                )
+
+        return {
+            OUTPUT_KEYS.semantic_logits: train_outputs[
+                OUTPUT_KEYS.semantic_logits
+            ].detach(),
+            OUTPUT_KEYS.clip_dense_logits: train_outputs[
+                OUTPUT_KEYS.clip_dense_logits
+            ].detach(),
+            OUTPUT_KEYS.class_query: train_outputs[
+                OUTPUT_KEYS.class_query
+            ],
+            "chunk_class_ids": list(chunk["chunk_class_ids"]),
+        }
+
     def _compute_chunk_loss_sums(
-        self,
-        batch,
-        do_backward: bool,
+            self,
+            batch,
+            do_backward: bool,
     ) -> tuple[Dict[str, float], int, bool]:
         if not hasattr(self.model, "iter_chunk_outputs"):
             raise AttributeError(
                 "Model does not provide iter_chunk_outputs(batch). "
                 "The chunked training pipeline requires this interface."
+            )
+
+        if not hasattr(self.model, "run_final_mixer_from_chunks"):
+            raise AttributeError(
+                "Model does not provide run_final_mixer_from_chunks(mixer_cache, batch). "
+                "The suppression-gate training pipeline requires this interface."
             )
 
         label_map = batch.find_targets[0].semantic_label_map
@@ -212,6 +249,7 @@ class Trainer:
         loss_sums: Optional[Dict[str, float]] = None
         total_valid_pixels = 0
         did_backward = False
+        mixer_cache = []
 
         chunk_iter = self.model.iter_chunk_outputs(batch)
 
@@ -219,6 +257,7 @@ class Trainer:
             try:
                 with autocast(device_type=self.device.type, enabled=use_amp):
                     chunk = next(chunk_iter)
+
                     loss_dict = self.criterion(
                         chunk["train_outputs"],
                         {"label_map": label_map},
@@ -235,10 +274,12 @@ class Trainer:
                         loss_sums = self._make_empty_loss_sums_from_loss_dict(loss_dict)
 
                     chunk_total_loss = loss_dict["total_loss"]
+                    mixer_cache.append(self._build_final_mixer_cache_item(chunk))
             except StopIteration:
                 break
 
             chunk_num_valid = int(loss_dict["num_valid"].detach().item())
+
             self._accumulate_weighted_loss_sums(
                 loss_sums=loss_sums,
                 loss_dict=loss_dict,
@@ -256,6 +297,55 @@ class Trainer:
 
         if loss_sums is None:
             loss_sums = {"total_loss": 0.0}
+
+        if len(mixer_cache) == 0:
+            return loss_sums, total_valid_pixels, did_backward
+
+        with autocast(device_type=self.device.type, enabled=use_amp):
+            final_raw_outputs = self.model.run_final_mixer_from_chunks(
+                mixer_cache=mixer_cache,
+                batch=batch,
+            )
+
+            final_outputs = self.model.adapter(
+                raw_outputs=final_raw_outputs,
+                batch=batch,
+                expected_num_classes=None,
+                output_mode="final",
+            )
+
+            final_loss_dict = self.criterion(
+                final_outputs,
+                {"label_map": label_map},
+                chunk_class_ids=None,
+                reduction="mean",
+            )
+
+            if "total_loss" not in final_loss_dict:
+                raise ValueError("Criterion must return 'total_loss' for final outputs.")
+            if "num_valid" not in final_loss_dict:
+                raise ValueError("Criterion must return 'num_valid' for final outputs.")
+
+            final_total_loss = final_loss_dict["total_loss"]
+
+        final_num_valid = int(final_loss_dict["num_valid"].detach().item())
+
+        self._accumulate_weighted_loss_sums(
+            loss_sums=loss_sums,
+            loss_dict=final_loss_dict,
+            weight=final_num_valid,
+        )
+        total_valid_pixels += final_num_valid
+
+        if do_backward and final_num_valid > 0:
+            self.scaler.scale(final_total_loss).backward()
+            did_backward = True
+
+        del mixer_cache
+        del final_raw_outputs
+        del final_outputs
+        del final_loss_dict
+        del final_total_loss
 
         return loss_sums, total_valid_pixels, did_backward
 

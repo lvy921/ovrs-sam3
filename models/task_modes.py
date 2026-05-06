@@ -16,8 +16,16 @@ VALID_TASK_MODES = {
 class ModelOutputKeys:
     semantic_logits: str = "semantic_logits"
     semantic_score_map: str = "semantic_score_map"
+
     presence_logits: str = "presence_logits"
     presence_score: str = "presence_score"
+
+    clip_dense_logits: str = "clip_dense_logits"
+    class_query: str = "class_query"
+
+    suppression_logits: str = "suppression_logits"
+    suppression_gate: str = "suppression_gate"
+
     final_logits: str = "final_logits"
     final_score_map: str = "final_score_map"
     final_pred: str = "final_pred"

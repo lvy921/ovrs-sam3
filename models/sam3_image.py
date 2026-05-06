@@ -11,6 +11,246 @@ from .geometry_encoders import Prompt
 from .task_modes import OUTPUT_KEYS, TASK_MODE_SEMANTIC, normalize_task_mode
 from .vl_combiner import SAM3VLBackbone
 
+def _choose_group_norm_groups(num_channels: int, preferred_groups: int = 8) -> int:
+    for groups in (preferred_groups, 4, 2, 1):
+        if groups <= num_channels and num_channels % groups == 0:
+            return groups
+    return 1
+
+
+class BranchEmbeddingScoreFusion(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int = 128,
+        norm_groups: int = 8,
+        class_attn_heads: int = 4,
+        class_attn_pooling_size: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.hidden_dim = int(hidden_dim)
+        self.class_attn_heads = int(class_attn_heads)
+        self.class_attn_pooling_size = int(class_attn_pooling_size)
+
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
+        if self.class_attn_heads <= 0:
+            raise ValueError(
+                f"class_attn_heads must be positive, got {class_attn_heads}."
+            )
+        if self.hidden_dim % self.class_attn_heads != 0:
+            raise ValueError(
+                "hidden_dim must be divisible by class_attn_heads, "
+                f"got hidden_dim={self.hidden_dim}, "
+                f"class_attn_heads={self.class_attn_heads}."
+            )
+
+        groups = _choose_group_norm_groups(
+            num_channels=self.hidden_dim,
+            preferred_groups=int(norm_groups),
+        )
+
+        self.sam_score_embed = nn.Sequential(
+            nn.Conv2d(1, self.hidden_dim, kernel_size=7, padding=3),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+        )
+
+        self.clip_score_embed = nn.Sequential(
+            nn.Conv2d(1, self.hidden_dim, kernel_size=7, padding=3),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+        )
+
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(
+                2 * self.hidden_dim,
+                self.hidden_dim,
+                kernel_size=7,
+                padding=3,
+            ),
+            nn.GroupNorm(groups, self.hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1),
+        )
+
+        self.class_attn_norm = nn.LayerNorm(self.hidden_dim)
+        self.class_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=self.class_attn_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+
+        self.class_ffn_norm = nn.LayerNorm(self.hidden_dim)
+        self.class_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
+        )
+
+    def _pool_fused_memory(
+        self,
+        fused_memory: torch.Tensor,
+    ) -> torch.Tensor:
+        pooling_size = int(self.class_attn_pooling_size)
+        if pooling_size <= 1:
+            return fused_memory
+
+        batch_size, num_classes, hidden_dim, height, width = fused_memory.shape
+
+        if height < pooling_size or width < pooling_size:
+            return fused_memory
+
+        x = fused_memory.reshape(
+            batch_size * num_classes,
+            hidden_dim,
+            height,
+            width,
+        )
+
+        x = F.avg_pool2d(
+            x,
+            kernel_size=pooling_size,
+            stride=pooling_size,
+        )
+
+        pooled_h, pooled_w = int(x.shape[-2]), int(x.shape[-1])
+        return x.reshape(
+            batch_size,
+            num_classes,
+            hidden_dim,
+            pooled_h,
+            pooled_w,
+        )
+
+    def _run_pooled_class_attention(
+        self,
+        fused_memory: torch.Tensor,
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        batch_size, num_classes, hidden_dim, pooled_h, pooled_w = fused_memory.shape
+
+        x = fused_memory.permute(0, 3, 4, 1, 2).contiguous()
+        x = x.reshape(
+            batch_size * pooled_h * pooled_w,
+            num_classes,
+            hidden_dim,
+        )
+
+        attn_in = self.class_attn_norm(x)
+        attn_out, _ = self.class_attn(
+            query=attn_in,
+            key=attn_in,
+            value=attn_in,
+            need_weights=False,
+        )
+        x = x + attn_out
+
+        ffn_in = self.class_ffn_norm(x)
+        x = x + self.class_ffn(ffn_in)
+
+        x = x.reshape(
+            batch_size,
+            pooled_h,
+            pooled_w,
+            num_classes,
+            hidden_dim,
+        )
+        x = x.permute(0, 3, 4, 1, 2).contiguous()
+
+        target_h, target_w = int(target_hw[0]), int(target_hw[1])
+        if (pooled_h, pooled_w) == (target_h, target_w):
+            return x
+
+        x = x.reshape(
+            batch_size * num_classes,
+            hidden_dim,
+            pooled_h,
+            pooled_w,
+        )
+        x = F.interpolate(
+            x,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x.reshape(
+            batch_size,
+            num_classes,
+            hidden_dim,
+            target_h,
+            target_w,
+        )
+
+    def forward(
+        self,
+        semantic_logits: torch.Tensor,
+        clip_dense_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if semantic_logits.dim() != 4:
+            raise ValueError(
+                f"semantic_logits must be [B, C, H, W], "
+                f"got {tuple(semantic_logits.shape)}."
+            )
+        if clip_dense_logits.dim() != 4:
+            raise ValueError(
+                f"clip_dense_logits must be [B, C, H, W], "
+                f"got {tuple(clip_dense_logits.shape)}."
+            )
+        if semantic_logits.shape != clip_dense_logits.shape:
+            raise ValueError(
+                "semantic_logits and clip_dense_logits must have the same shape, "
+                f"got {tuple(semantic_logits.shape)} and "
+                f"{tuple(clip_dense_logits.shape)}."
+            )
+
+        batch_size, num_classes, height, width = semantic_logits.shape
+
+        sam_input = semantic_logits.reshape(batch_size * num_classes, 1, height, width)
+        clip_input = clip_dense_logits.reshape(batch_size * num_classes, 1, height, width)
+
+        sam_embed = self.sam_score_embed(sam_input)
+        clip_embed = self.clip_score_embed(clip_input)
+
+        fused = torch.cat([sam_embed, clip_embed], dim=1)
+        fused = self.fusion_conv(fused)
+
+        # Anchor the fused feature to SAM3 boundary-aware score features.
+        fused = fused + sam_embed
+
+        fused_memory = fused.reshape(
+            batch_size,
+            num_classes,
+            self.hidden_dim,
+            height,
+            width,
+        )
+
+        pooled_memory = self._pool_fused_memory(fused_memory)
+        class_delta = self._run_pooled_class_attention(
+            fused_memory=pooled_memory,
+            target_hw=(height, width),
+        )
+
+        fused_memory = fused_memory + class_delta
+
+        if fused_memory.shape[:2] != semantic_logits.shape[:2]:
+            raise RuntimeError(
+                "fused_memory batch/class shape mismatch: "
+                f"{tuple(fused_memory.shape[:2])} vs "
+                f"{tuple(semantic_logits.shape[:2])}."
+            )
+        if fused_memory.shape[-2:] != semantic_logits.shape[-2:]:
+            raise RuntimeError(
+                "fused_memory spatial shape mismatch: "
+                f"{tuple(fused_memory.shape[-2:])} vs "
+                f"{tuple(semantic_logits.shape[-2:])}."
+            )
+
+        return fused_memory
 
 class Sam3Image(torch.nn.Module):
     def __init__(
@@ -35,6 +275,7 @@ class Sam3Image(torch.nn.Module):
         clip_image_encoder=None,
         clip_text_encoder=None,
         openclip_cfg=None,
+        final_mixer_cfg=None,
         task_mode: str = TASK_MODE_SEMANTIC,
         **kwargs,
     ):
@@ -136,24 +377,75 @@ class Sam3Image(torch.nn.Module):
             self.extra_token_mask_memory_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
             self.extra_token_logit_scale = nn.Parameter(torch.tensor(2.3, dtype=torch.float32))
 
-        self.presence_seed_proj = nn.Linear(self.hidden_dim * 3, self.hidden_dim)
-        nn.init.xavier_uniform_(self.presence_seed_proj.weight)
-        nn.init.zeros_(self.presence_seed_proj.bias)
+        self.final_mixer_hidden_dim = int(
+            getattr(final_mixer_cfg, "hidden_dim", 128)
+        )
+        self.final_mixer_num_heads = int(
+            getattr(final_mixer_cfg, "num_heads", 8)
+        )
+        self.final_mixer_dropout = float(
+            getattr(final_mixer_cfg, "dropout", 0.1)
+        )
+        gate_bias_init = float(
+            getattr(final_mixer_cfg, "gate_bias_init", 3.0)
+        )
+        self.final_mixer_class_attn_heads = int(
+            getattr(final_mixer_cfg, "class_attn_heads", 4)
+        )
+        self.final_mixer_class_attn_pooling_size = int(
+            getattr(final_mixer_cfg, "class_attn_pooling_size", 2)
+        )
 
-        self.presence_cross_attn = nn.MultiheadAttention(
+        if self.final_mixer_hidden_dim % self.final_mixer_num_heads != 0:
+            raise ValueError(
+                "final_mixer_hidden_dim must be divisible by final_mixer_num_heads, "
+                f"got hidden_dim={self.final_mixer_hidden_dim}, "
+                f"num_heads={self.final_mixer_num_heads}."
+            )
+
+        self.class_query_seed_proj = nn.Linear(self.hidden_dim * 3, self.hidden_dim)
+        nn.init.xavier_uniform_(self.class_query_seed_proj.weight)
+        nn.init.zeros_(self.class_query_seed_proj.bias)
+
+        self.class_query_encoder_cross_attn = nn.MultiheadAttention(
             embed_dim=self.hidden_dim,
             num_heads=8,
             dropout=0.1,
             batch_first=True,
         )
-        self.presence_cross_attn_norm = nn.LayerNorm(self.hidden_dim)
-        self.presence_head = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim, 1),
+        self.class_query_encoder_cross_attn_norm = nn.LayerNorm(self.hidden_dim)
+
+        if self.final_mixer_hidden_dim == self.hidden_dim:
+            self.class_query_proj = nn.Identity()
+        else:
+            self.class_query_proj = nn.Linear(self.hidden_dim, self.final_mixer_hidden_dim)
+
+        self.class_query_self_attn = nn.MultiheadAttention(
+            embed_dim=self.final_mixer_hidden_dim,
+            num_heads=self.final_mixer_num_heads,
+            dropout=self.final_mixer_dropout,
+            batch_first=True,
         )
+        self.class_query_self_attn_norm = nn.LayerNorm(self.final_mixer_hidden_dim)
+
+        self.score_fusion_block = BranchEmbeddingScoreFusion(
+            hidden_dim=self.final_mixer_hidden_dim,
+            norm_groups=8,
+            class_attn_heads=self.final_mixer_class_attn_heads,
+            class_attn_pooling_size=self.final_mixer_class_attn_pooling_size,
+            dropout=self.final_mixer_dropout,
+        )
+
+        self.suppression_query_cross_attn = nn.MultiheadAttention(
+            embed_dim=self.final_mixer_hidden_dim,
+            num_heads=self.final_mixer_num_heads,
+            dropout=self.final_mixer_dropout,
+            batch_first=True,
+        )
+        self.suppression_query_cross_attn_norm = nn.LayerNorm(self.final_mixer_hidden_dim)
+
+        self.suppression_logit_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.suppression_gate_bias = nn.Parameter(torch.tensor(gate_bias_init, dtype=torch.float32))
 
         self.prompt_chunk_size = None
         self._text_cache: Optional[Dict[str, torch.Tensor]] = None
@@ -509,12 +801,16 @@ class Sam3Image(torch.nn.Module):
         valid = (~mask).to(dtype=x.dtype).unsqueeze(-1)
         return (x * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
 
-    def _build_presence_query(self, extra_summary: torch.Tensor, sam3_summary: torch.Tensor) -> torch.Tensor:
-        presence_seed = torch.cat(
+    def _build_class_query_seed(
+            self,
+            extra_summary: torch.Tensor,
+            sam3_summary: torch.Tensor,
+    ) -> torch.Tensor:
+        query_seed = torch.cat(
             [sam3_summary, extra_summary, sam3_summary * extra_summary],
             dim=-1,
         )
-        return self.presence_seed_proj(presence_seed)
+        return self.class_query_seed_proj(query_seed)
 
     @staticmethod
     def _prepare_encoder_tokens(
@@ -542,24 +838,93 @@ class Sam3Image(torch.nn.Module):
 
         return encoder_tokens, padding_mask
 
-    def _run_presence_head(self, presence_query: torch.Tensor, encoder_out: Dict[str, torch.Tensor]) -> torch.Tensor:
-        num_pairs = int(presence_query.shape[0])
+    def _run_class_query_encoder_cross_attn(
+            self,
+            class_query_seed: torch.Tensor,
+            encoder_out: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        num_pairs = int(class_query_seed.shape[0])
+
         encoder_tokens, encoder_padding_mask = self._prepare_encoder_tokens(
             encoder_hidden_states=encoder_out["encoder_hidden_states"],
             padding_mask=encoder_out.get("padding_mask", None),
             num_pairs=num_pairs,
         )
 
-        query = presence_query.unsqueeze(1)
-        attn_out, _ = self.presence_cross_attn(
+        encoder_tokens = encoder_tokens.detach()
+        if encoder_padding_mask is not None:
+            encoder_padding_mask = encoder_padding_mask.detach()
+
+        query = class_query_seed.unsqueeze(1)
+
+        attn_out, _ = self.class_query_encoder_cross_attn(
             query=query,
             key=encoder_tokens,
             value=encoder_tokens,
             key_padding_mask=encoder_padding_mask,
             need_weights=False,
         )
-        presence_context = self.presence_cross_attn_norm(query + attn_out).squeeze(1)
-        return self.presence_head(presence_context).squeeze(-1)
+
+        class_query = self.class_query_encoder_cross_attn_norm(query + attn_out)
+        return class_query.squeeze(1)
+
+    def _build_clip_dense_logits(
+            self,
+            clip_image_feat_map_native: torch.Tensor,
+            clip_text_tokens_native: torch.Tensor,
+            target_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        if clip_image_feat_map_native.dim() != 4:
+            raise ValueError(
+                "clip_image_feat_map_native must be [B, D_clip, Hc, Wc], "
+                f"got {tuple(clip_image_feat_map_native.shape)}."
+            )
+
+        if clip_text_tokens_native.dim() != 3:
+            raise ValueError(
+                "clip_text_tokens_native must be [C, K, D_clip], "
+                f"got {tuple(clip_text_tokens_native.shape)}."
+            )
+
+        batch_size, image_dim, _, _ = clip_image_feat_map_native.shape
+        num_classes, _, text_dim = clip_text_tokens_native.shape
+
+        if image_dim != text_dim:
+            raise ValueError(
+                f"CLIP image/text dim mismatch: image_dim={image_dim}, text_dim={text_dim}."
+            )
+
+        clip_text_tokens_native = clip_text_tokens_native.to(
+            device=clip_image_feat_map_native.device,
+            dtype=clip_image_feat_map_native.dtype,
+        )
+
+        image_feat = F.normalize(clip_image_feat_map_native, dim=1, eps=1e-6)
+        text_feat = F.normalize(clip_text_tokens_native, dim=-1, eps=1e-6)
+
+        class_text_feat = text_feat.mean(dim=1)
+        class_text_feat = F.normalize(class_text_feat, dim=-1, eps=1e-6)
+
+        clip_dense_logits = torch.einsum(
+            "bdhw,cd->bchw",
+            image_feat,
+            class_text_feat,
+        )
+
+        if tuple(clip_dense_logits.shape[-2:]) != tuple(target_hw):
+            clip_dense_logits = F.interpolate(
+                clip_dense_logits,
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if clip_dense_logits.shape[0] != batch_size:
+            raise ValueError("Internal error: CLIP dense logits batch size changed.")
+        if clip_dense_logits.shape[1] != num_classes:
+            raise ValueError("Internal error: CLIP dense logits class count changed.")
+
+        return clip_dense_logits.contiguous()
 
     def iter_chunk_raw_outputs(self, input: BatchedDatapoint) -> Iterator[Dict[str, Any]]:
         device = self.device
@@ -630,9 +995,9 @@ class Sam3Image(torch.nn.Module):
 
             chunk_backbone_out["clip_language_features_pair"] = extra_tokens.transpose(0, 1).contiguous()
             chunk_backbone_out["clip_language_mask_pair"] = sam3_pair_mask
-            chunk_backbone_out["presence_query_pair"] = self._build_presence_query(
-                extra_summary=extra_summary,
-                sam3_summary=sam3_summary,
+            chunk_backbone_out["class_query_seed_pair"] = self._build_class_query_seed(
+                extra_summary=extra_summary.detach(),
+                sam3_summary=sam3_summary.detach(),
             )
             chunk_backbone_out["extra_tokens_pair"] = extra_tokens
             chunk_backbone_out["extra_tokens_mask_pair"] = sam3_pair_mask
@@ -649,16 +1014,30 @@ class Sam3Image(torch.nn.Module):
                 geometric_prompt=geometric_prompt,
             )
 
+            chunk_outputs = self._extract_and_reshape_chunk_outputs(
+                raw_outputs=raw_outputs,
+                batch_size=batch_size,
+                num_chunk_classes=num_chunk_classes,
+            )
+
+            semantic_logits = self._ensure_4d_logits(
+                chunk_outputs[OUTPUT_KEYS.semantic_logits],
+                OUTPUT_KEYS.semantic_logits,
+            )
+
+            chunk_outputs[OUTPUT_KEYS.semantic_logits] = semantic_logits
+            chunk_outputs[OUTPUT_KEYS.clip_dense_logits] = self._build_clip_dense_logits(
+                clip_image_feat_map_native=clip_image_cache["clip_image_feat_map_native"],
+                clip_text_tokens_native=chunk_text_cache["clip_text_tokens_native"],
+                target_hw=tuple(semantic_logits.shape[-2:]),
+            )
+
             yield {
                 "chunk_start": start,
                 "chunk_end": end,
                 "chunk_class_ids": chunk_class_ids,
                 "chunk_class_names": chunk_texts,
-                "raw_outputs": self._extract_and_reshape_chunk_outputs(
-                    raw_outputs=raw_outputs,
-                    batch_size=batch_size,
-                    num_chunk_classes=num_chunk_classes,
-                ),
+                "raw_outputs": chunk_outputs,
             }
 
     @staticmethod
@@ -715,24 +1094,34 @@ class Sam3Image(torch.nn.Module):
         return x.reshape(batch_size, num_chunk_classes, *x.shape[1:])
 
     def _extract_and_reshape_chunk_outputs(
-        self,
-        raw_outputs: Dict[str, torch.Tensor],
-        batch_size: int,
-        num_chunk_classes: int,
+            self,
+            raw_outputs: Dict[str, torch.Tensor],
+            batch_size: int,
+            num_chunk_classes: int,
     ) -> Dict[str, torch.Tensor]:
         out = {}
+
         for key in (
-            OUTPUT_KEYS.semantic_logits,
-            OUTPUT_KEYS.presence_logits,
-            OUTPUT_KEYS.extra_token_aux_logits,
+                OUTPUT_KEYS.semantic_logits,
+                OUTPUT_KEYS.class_query,
+                OUTPUT_KEYS.extra_token_aux_logits,
         ):
-            if key in raw_outputs and raw_outputs[key] is not None:
-                out[key] = self._reshape_prompt_first_tensor(
-                    raw_outputs[key],
-                    batch_size=batch_size,
-                    num_chunk_classes=num_chunk_classes,
-                    key=key,
-                )
+            if key not in raw_outputs or raw_outputs[key] is None:
+                continue
+
+            out[key] = self._reshape_prompt_first_tensor(
+                raw_outputs[key],
+                batch_size=batch_size,
+                num_chunk_classes=num_chunk_classes,
+                key=key,
+            )
+
+        if OUTPUT_KEYS.semantic_logits in out:
+            out[OUTPUT_KEYS.semantic_logits] = self._ensure_4d_logits(
+                out[OUTPUT_KEYS.semantic_logits],
+                OUTPUT_KEYS.semantic_logits,
+            )
+
         return out
 
     @staticmethod
@@ -746,6 +1135,172 @@ class Sam3Image(torch.nn.Module):
             if values:
                 merged[key] = torch.cat(values, dim=1)
         return merged
+
+    @staticmethod
+    def _ensure_4d_logits(x: torch.Tensor, key: str) -> torch.Tensor:
+        if x.dim() == 5:
+            if x.shape[2] != 1:
+                raise ValueError(
+                    f"Expected {key} as [B, C, 1, H, W] when 5D, "
+                    f"got {tuple(x.shape)}."
+                )
+            x = x[:, :, 0]
+
+        if x.dim() != 4:
+            raise ValueError(
+                f"Expected {key} as [B, C, H, W], got {tuple(x.shape)}."
+            )
+
+        return x
+
+    def run_final_mixer(
+            self,
+            semantic_logits: torch.Tensor,
+            clip_dense_logits: torch.Tensor,
+            class_query: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        semantic_logits = self._ensure_4d_logits(
+            semantic_logits,
+            OUTPUT_KEYS.semantic_logits,
+        )
+        clip_dense_logits = self._ensure_4d_logits(
+            clip_dense_logits,
+            OUTPUT_KEYS.clip_dense_logits,
+        )
+
+        if semantic_logits.shape != clip_dense_logits.shape:
+            raise ValueError(
+                "semantic_logits and clip_dense_logits must have the same shape, "
+                f"got {tuple(semantic_logits.shape)} and {tuple(clip_dense_logits.shape)}."
+            )
+
+        if class_query.dim() != 3:
+            raise ValueError(
+                f"class_query must be [B, C, D], got {tuple(class_query.shape)}."
+            )
+
+        batch_size, num_classes, height, width = semantic_logits.shape
+
+        if class_query.shape[:2] != (batch_size, num_classes):
+            raise ValueError(
+                "class_query shape mismatch: "
+                f"class_query.shape[:2]={tuple(class_query.shape[:2])}, "
+                f"expected={(batch_size, num_classes)}."
+            )
+
+        class_query = self.class_query_proj(class_query)
+
+        query_delta, _ = self.class_query_self_attn(
+            query=class_query,
+            key=class_query,
+            value=class_query,
+            need_weights=False,
+        )
+        class_query_context = self.class_query_self_attn_norm(class_query + query_delta)
+
+        fused_memory = self.score_fusion_block(
+            semantic_logits=semantic_logits,
+            clip_dense_logits=clip_dense_logits,
+        )
+
+        memory_tokens = fused_memory.flatten(3).permute(0, 1, 3, 2).contiguous()
+        memory_tokens = memory_tokens.reshape(
+            batch_size * num_classes,
+            height * width,
+            self.final_mixer_hidden_dim,
+        )
+
+        query_tokens = class_query_context.reshape(
+            batch_size * num_classes,
+            self.final_mixer_hidden_dim,
+        ).unsqueeze(1)
+
+        attended_query, _ = self.suppression_query_cross_attn(
+            query=query_tokens,
+            key=memory_tokens,
+            value=memory_tokens,
+            need_weights=False,
+        )
+
+        attended_query = self.suppression_query_cross_attn_norm(
+            query_tokens + attended_query
+        )
+        attended_query = attended_query.squeeze(1).reshape(
+            batch_size,
+            num_classes,
+            self.final_mixer_hidden_dim,
+        )
+
+        suppression_logits = torch.einsum(
+            "bcd,bcdhw->bchw",
+            attended_query,
+            fused_memory,
+        )
+        suppression_logits = suppression_logits * self.suppression_logit_scale
+
+        suppression_gate = torch.sigmoid(
+            suppression_logits + self.suppression_gate_bias
+        )
+
+        pos_logits = semantic_logits.clamp_min(0.0)
+        neg_logits = semantic_logits.clamp_max(0.0)
+
+        pos_scale = suppression_gate
+        neg_scale = 1.0 + (1.0 - suppression_gate)
+
+        final_logits = pos_logits * pos_scale + neg_logits * neg_scale
+
+        return {
+            OUTPUT_KEYS.semantic_logits: semantic_logits,
+            OUTPUT_KEYS.clip_dense_logits: clip_dense_logits,
+            OUTPUT_KEYS.class_query: class_query_context,
+            OUTPUT_KEYS.suppression_logits: suppression_logits,
+            OUTPUT_KEYS.suppression_gate: suppression_gate,
+            OUTPUT_KEYS.final_logits: final_logits,
+        }
+
+    def run_final_mixer_from_chunks(
+            self,
+            mixer_cache: List[Dict[str, torch.Tensor]],
+            batch: Optional[BatchedDatapoint] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if len(mixer_cache) == 0:
+            raise ValueError("mixer_cache is empty.")
+
+        mixer_cache = sorted(
+            mixer_cache,
+            key=lambda item: int(item["chunk_class_ids"][0]),
+        )
+
+        semantic_logits = torch.cat(
+            [item[OUTPUT_KEYS.semantic_logits] for item in mixer_cache],
+            dim=1,
+        )
+        clip_dense_logits = torch.cat(
+            [item[OUTPUT_KEYS.clip_dense_logits] for item in mixer_cache],
+            dim=1,
+        )
+        class_query = torch.cat(
+            [item[OUTPUT_KEYS.class_query] for item in mixer_cache],
+            dim=1,
+        )
+
+        merged_class_ids = []
+        for item in mixer_cache:
+            merged_class_ids.extend([int(x) for x in item["chunk_class_ids"]])
+
+        expected_class_ids = list(range(len(merged_class_ids)))
+        if merged_class_ids != expected_class_ids:
+            raise ValueError(
+                "mixer_cache chunks must cover classes in order without gaps. "
+                f"Got {merged_class_ids}, expected {expected_class_ids}."
+            )
+
+        return self.run_final_mixer(
+            semantic_logits=semantic_logits,
+            clip_dense_logits=clip_dense_logits,
+            class_query=class_query,
+        )
 
     def _get_img_feats(self, backbone_out, img_ids):
         vis_feats = backbone_out["backbone_fpn"][-self.num_feature_levels:]
@@ -900,8 +1455,8 @@ class Sam3Image(torch.nn.Module):
             extra_token_mask=backbone_out["extra_tokens_mask_pair"],
             encoder_out=encoder_out,
         )
-        out[OUTPUT_KEYS.presence_logits] = self._run_presence_head(
-            presence_query=backbone_out["presence_query_pair"],
+        out[OUTPUT_KEYS.class_query] = self._run_class_query_encoder_cross_attn(
+            class_query_seed=backbone_out["class_query_seed_pair"],
             encoder_out=encoder_out,
         )
         return out

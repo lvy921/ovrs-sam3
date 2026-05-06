@@ -83,12 +83,15 @@ def build_log_getters(cfg) -> List[object]:
 
         model = trainer.model
         model = getattr(model, "module", model)
+        core = getattr(model, "core", None)
 
-        adapter = getattr(model, "adapter", None)
+        if core is not None and hasattr(core, "suppression_gate_bias"):
+            bias = core.suppression_gate_bias.detach()
+            out["suppression_gate_bias"] = float(bias.item())
 
-        if adapter is not None and hasattr(adapter, "presence_modulation_alpha"):
-            alpha = adapter.presence_modulation_alpha.detach()
-            out["presence_modulation_alpha"] = float(alpha.item())
+        if core is not None and hasattr(core, "suppression_logit_scale"):
+            scale = core.suppression_logit_scale.detach()
+            out["suppression_logit_scale"] = float(scale.item())
 
         return out
 

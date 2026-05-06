@@ -9,8 +9,11 @@ visualization = dict(
     save_ground_truth=True,
     save_semantic_prediction=True,
 
-    save_presence_summary=True,
+    save_score_summary=True,
     save_score_heatmaps=True,
+    save_suppression_heatmaps=True,
+    save_extra_token_aux_heatmaps=True,
+    heatmap_colormap="turbo",
 
     save_clip_argmax_prediction=True,
     save_clip_score_heatmaps=True,
