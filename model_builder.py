@@ -112,13 +112,15 @@ class OpenCLIPConfig:
 @dataclass
 class FinalMixerConfig:
     enabled: bool = True
-    hidden_dim: int = 128
+    score_dim: int = 32
+    class_dim: int = 128
+    attn_dim: int = 160
     num_heads: int = 8
+    fusion_layers: int = 2
     dropout: float = 0.1
-    gate_bias_init: float = 3.0
-
-    class_attn_heads: int = 4
-    class_attn_pooling_size: int = 2
+    clip_feature_dim: int = 256
+    use_final_residual: bool = True
+    clip_residual_init: float = 0.1
 
 @dataclass
 class CriterionConfig:
@@ -138,9 +140,6 @@ class CriterionConfig:
     extra_token_aux_absent_topk_ratio: float = 0.05
     extra_token_aux_exclude_bg: bool = True
     extra_token_aux_bg_idx: int = 0
-
-    suppression_absent_loss_weight: float = 0.05
-    suppression_absent_topk_ratio: float = 0.05
 
     bce_class_balance_clamp_min: float = 0.2
     bce_class_balance_clamp_max: float = 5.0
@@ -671,13 +670,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
                 ),
                 extra_token_aux_bg_idx=int(
                     cfg.criterion_cfg.extra_token_aux_bg_idx
-                ),
-
-                suppression_absent_loss_weight=float(
-                    cfg.criterion_cfg.suppression_absent_loss_weight
-                ),
-                suppression_absent_topk_ratio=float(
-                    cfg.criterion_cfg.suppression_absent_topk_ratio
                 ),
 
                 bce_class_balance_clamp_min=float(

@@ -41,6 +41,12 @@ class SAM3Segmentor(nn.Module):
             force=force,
         )
 
+    def build_shared_clip_feature(
+        self,
+        batch: BatchedDatapoint,
+    ) -> torch.Tensor:
+        return self.core.build_shared_clip_feature(batch)
+
     @staticmethod
     def _build_mixer_cache_item(
         outputs: Dict[str, torch.Tensor],
@@ -49,7 +55,6 @@ class SAM3Segmentor(nn.Module):
     ) -> Dict[str, torch.Tensor | list[int]]:
         required_keys = (
             OUTPUT_KEYS.semantic_logits,
-            OUTPUT_KEYS.clip_dense_logits,
             OUTPUT_KEYS.class_query,
         )
 
@@ -60,16 +65,13 @@ class SAM3Segmentor(nn.Module):
                 )
 
         semantic_logits = outputs[OUTPUT_KEYS.semantic_logits]
-        clip_dense_logits = outputs[OUTPUT_KEYS.clip_dense_logits]
         class_query = outputs[OUTPUT_KEYS.class_query]
 
         if detach_score_maps:
             semantic_logits = semantic_logits.detach()
-            clip_dense_logits = clip_dense_logits.detach()
 
         return {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
-            OUTPUT_KEYS.clip_dense_logits: clip_dense_logits,
             OUTPUT_KEYS.class_query: class_query,
             "chunk_class_ids": list(chunk_class_ids),
         }
@@ -77,8 +79,12 @@ class SAM3Segmentor(nn.Module):
     def iter_chunk_outputs(
         self,
         batch: BatchedDatapoint,
+        shared_clip_feature: Optional[torch.Tensor] = None,
     ) -> Iterator[Dict[str, Any]]:
-        for chunk in self.core.iter_chunk_raw_outputs(batch):
+        for chunk in self.core.iter_chunk_raw_outputs(
+            batch,
+            shared_clip_feature=shared_clip_feature,
+        ):
             raw_outputs = chunk["raw_outputs"]
             chunk_class_ids = chunk["chunk_class_ids"]
 
@@ -102,17 +108,24 @@ class SAM3Segmentor(nn.Module):
         self,
         mixer_cache: List[Dict[str, torch.Tensor | list[int]]],
         batch: Optional[BatchedDatapoint] = None,
+        shared_clip_feature: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         return self.core.run_final_mixer_from_chunks(
             mixer_cache=mixer_cache,
             batch=batch,
+            shared_clip_feature=shared_clip_feature,
         )
 
     def forward(self, batch: BatchedDatapoint) -> dict[str, torch.Tensor]:
+        shared_clip_feature = self.build_shared_clip_feature(batch)
+
         mixer_cache = []
         extra_token_aux_chunks = []
 
-        for chunk in self.core.iter_chunk_raw_outputs(batch):
+        for chunk in self.core.iter_chunk_raw_outputs(
+                batch,
+                shared_clip_feature=shared_clip_feature,
+        ):
             raw_outputs = chunk["raw_outputs"]
 
             chunk_outputs = self.adapter(
@@ -138,6 +151,7 @@ class SAM3Segmentor(nn.Module):
         final_raw_outputs = self.run_final_mixer_from_chunks(
             mixer_cache=mixer_cache,
             batch=batch,
+            shared_clip_feature=shared_clip_feature,
         )
 
         if len(extra_token_aux_chunks) > 0:

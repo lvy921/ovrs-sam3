@@ -27,12 +27,10 @@ class VisualizerConfig:
 
     save_score_summary: bool = True
     save_score_heatmaps: bool = True
-    save_suppression_heatmaps: bool = True
     save_extra_token_aux_heatmaps: bool = True
     heatmap_colormap: str = "turbo"
 
     save_clip_argmax_prediction: bool = True
-    save_clip_score_heatmaps: bool = True
 
     vis_prob: float = 0.05
     max_samples_per_epoch: Optional[int] = 50
@@ -77,13 +75,16 @@ class BaseSemanticOverlayTask(VisualizationTask):
         semantic_score_map = semantic_outputs.get(OUTPUT_KEYS.semantic_score_map, None)
         semantic_pred = (
             manager._extract_pred_from_logits(semantic_score_map)
-            if semantic_score_map is not None else None
+            if semantic_score_map is not None
+            else None
         )
 
         gt = semantic_targets["label_map"]
         if gt.dim() == 4:
             if gt.shape[1] != 1:
-                raise ValueError(f"Expected gt as [B,1,H,W] or [B,H,W], got {tuple(gt.shape)}")
+                raise ValueError(
+                    f"Expected gt as [B,1,H,W] or [B,H,W], got {tuple(gt.shape)}"
+                )
             gt = gt[:, 0]
 
         pred_num_classes = int(final_score_map.shape[1])
@@ -169,7 +170,6 @@ class BranchScoreAnalysisTask(VisualizationTask):
             if final_logits is not None:
                 final_score_map = final_logits.sigmoid()
 
-        suppression_logits = outputs.get(OUTPUT_KEYS.suppression_logits, None)
         extra_token_aux_logits = outputs.get(OUTPUT_KEYS.extra_token_aux_logits, None)
 
         if semantic_score_map is None:
@@ -199,20 +199,16 @@ class BranchScoreAnalysisTask(VisualizationTask):
                 f"{tuple(semantic_score_map.shape)} vs {tuple(final_score_map.shape)}."
             )
 
-        for key, value in (
-            (OUTPUT_KEYS.suppression_logits, suppression_logits),
-            (OUTPUT_KEYS.extra_token_aux_logits, extra_token_aux_logits),
-        ):
-            if value is None:
-                continue
-            if value.dim() != 4:
+        if extra_token_aux_logits is not None:
+            if extra_token_aux_logits.dim() != 4:
                 raise ValueError(
-                    f"Expected {key} as [B, C, H, W], got {tuple(value.shape)}."
+                    "Expected extra_token_aux_logits as [B, C, H, W], "
+                    f"got {tuple(extra_token_aux_logits.shape)}."
                 )
-            if value.shape[:2] != semantic_score_map.shape[:2]:
+            if extra_token_aux_logits.shape[:2] != semantic_score_map.shape[:2]:
                 raise ValueError(
-                    f"{key} batch/class shape mismatch: "
-                    f"{tuple(value.shape[:2])} vs "
+                    "extra_token_aux_logits batch/class shape mismatch: "
+                    f"{tuple(extra_token_aux_logits.shape[:2])} vs "
                     f"{tuple(semantic_score_map.shape[:2])}."
                 )
 
@@ -234,12 +230,10 @@ class BranchScoreAnalysisTask(VisualizationTask):
 
             semantic_scores_b = semantic_score_map[b]
             final_scores_b = final_score_map[b]
-
-            suppression_logits_b = (
-                suppression_logits[b] if suppression_logits is not None else None
-            )
             extra_token_aux_logits_b = (
-                extra_token_aux_logits[b] if extra_token_aux_logits is not None else None
+                extra_token_aux_logits[b]
+                if extra_token_aux_logits is not None
+                else None
             )
 
             if manager.cfg.save_score_summary:
@@ -247,7 +241,6 @@ class BranchScoreAnalysisTask(VisualizationTask):
                     sample_dir=sample_dir,
                     semantic_scores=semantic_scores_b,
                     final_scores=final_scores_b,
-                    suppression_logits=suppression_logits_b,
                     extra_token_aux_logits=extra_token_aux_logits_b,
                     class_names=class_names,
                 )
@@ -257,20 +250,17 @@ class BranchScoreAnalysisTask(VisualizationTask):
                     sample_dir=sample_dir,
                     semantic_scores=semantic_scores_b,
                     final_scores=final_scores_b,
-                    suppression_logits=suppression_logits_b,
                     extra_token_aux_logits=extra_token_aux_logits_b,
                     out_hw=out_hw,
                     class_names=class_names,
                 )
 
+
 class ClipImageTextScoreTask(VisualizationTask):
     name = "clip_image_text_score"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
-        if (
-            not manager.cfg.save_clip_argmax_prediction
-            and not manager.cfg.save_clip_score_heatmaps
-        ):
+        if not manager.cfg.save_clip_argmax_prediction:
             return
 
         clip_score_map = manager._build_clip_image_text_score_map_for_visualization(
@@ -285,11 +275,6 @@ class ClipImageTextScoreTask(VisualizationTask):
                 f"Expected clip_score_map as [B, C, Hc, Wc], "
                 f"got {tuple(clip_score_map.shape)}."
             )
-
-        try:
-            class_names = [str(x) for x in ctx.batch.find_metadatas[0].class_names]
-        except Exception:
-            class_names = None
 
         num_classes = int(clip_score_map.shape[1])
 
@@ -311,27 +296,19 @@ class ClipImageTextScoreTask(VisualizationTask):
                 align_corners=False,
             )[0]
 
-            if manager.cfg.save_clip_argmax_prediction:
-                clip_pred = clip_score_up.argmax(dim=0).long()
+            clip_pred = clip_score_up.argmax(dim=0).long()
 
-                manager._colorize_label_map(
-                    clip_pred.detach().cpu(),
-                    num_classes=num_classes,
-                ).save(sample_dir / "clip_argmax_pred.png")
+            manager._colorize_label_map(
+                clip_pred.detach().cpu(),
+                num_classes=num_classes,
+            ).save(sample_dir / "clip_argmax_pred.png")
 
-                manager._overlay_label_map(
-                    overlay_image,
-                    clip_pred.detach().cpu(),
-                    num_classes=num_classes,
-                ).save(sample_dir / "clip_argmax_overlay.png")
+            manager._overlay_label_map(
+                overlay_image,
+                clip_pred.detach().cpu(),
+                num_classes=num_classes,
+            ).save(sample_dir / "clip_argmax_overlay.png")
 
-            if manager.cfg.save_clip_score_heatmaps:
-                manager._save_clip_score_heatmaps(
-                    sample_dir=sample_dir,
-                    clip_scores=clip_score_up,
-                    out_hw=out_hw,
-                    class_names=class_names,
-                )
 
 class VisualizationManager:
     def __init__(self, cfg: VisualizerConfig):
@@ -423,11 +400,12 @@ class VisualizationManager:
                 )
 
             batch_size, image_dim, grid_h, grid_w = clip_image_feat_map.shape
-            num_classes, num_templates, text_dim = clip_text_tokens.shape
+            num_classes, _, text_dim = clip_text_tokens.shape
 
             if image_dim != text_dim:
                 raise ValueError(
-                    f"CLIP image/text dim mismatch: image_dim={image_dim}, text_dim={text_dim}"
+                    f"CLIP image/text dim mismatch: image_dim={image_dim}, "
+                    f"text_dim={text_dim}"
                 )
 
             if num_classes != len(class_texts):
@@ -435,19 +413,13 @@ class VisualizationManager:
                     f"CLIP text class count mismatch: {num_classes} vs {len(class_texts)}"
                 )
 
-            # [B, D_clip, Hc, Wc] -> [B, Hc * Wc, D_clip]
             image_features = clip_image_feat_map.flatten(2).transpose(1, 2).contiguous()
-
             image_features = F.normalize(image_features, dim=-1, eps=1e-6)
 
             text_features = F.normalize(clip_text_tokens, dim=-1, eps=1e-6)
-
-            # [C, K, D_clip] -> [C, D_clip]
             text_features = text_features.mean(dim=1)
             text_features = F.normalize(text_features, dim=-1, eps=1e-6)
 
-            # [B, Hc * Wc, D_clip] 和 [C, D_clip] 做内积
-            # 输出 [B, C, Hc * Wc]
             clip_score = torch.einsum(
                 "bnd,cd->bcn",
                 image_features,
@@ -517,7 +489,11 @@ class VisualizationManager:
     @staticmethod
     def _extract_overlay_image(batch: Any, batch_index: int) -> Image.Image:
         raw_images = getattr(batch, "raw_images", None)
-        if raw_images is not None and batch_index < len(raw_images) and raw_images[batch_index] is not None:
+        if (
+            raw_images is not None
+            and batch_index < len(raw_images)
+            and raw_images[batch_index] is not None
+        ):
             return VisualizationManager._to_uint8_image(raw_images[batch_index])
         return VisualizationManager._to_uint8_image(batch.img_batch[batch_index])
 
@@ -532,7 +508,11 @@ class VisualizationManager:
             return VisualizationManager._to_uint8_image(raw_images_original[batch_index])
 
         raw_images = getattr(batch, "raw_images", None)
-        if raw_images is not None and batch_index < len(raw_images) and raw_images[batch_index] is not None:
+        if (
+            raw_images is not None
+            and batch_index < len(raw_images)
+            and raw_images[batch_index] is not None
+        ):
             return VisualizationManager._to_uint8_image(raw_images[batch_index])
 
         return VisualizationManager._to_uint8_image(batch.img_batch[batch_index])
@@ -545,7 +525,12 @@ class VisualizationManager:
         except Exception:
             return int(batch_index)
 
-    def _resolve_sample_dir(self, image_id: int, epoch: Optional[int], stage: str) -> Path:
+    def _resolve_sample_dir(
+        self,
+        image_id: int,
+        epoch: Optional[int],
+        stage: str,
+    ) -> Path:
         parts = [self.save_dir, stage]
         if epoch is not None:
             parts.append(Path(f"epoch_{epoch:03d}"))
@@ -555,7 +540,10 @@ class VisualizationManager:
         return sample_dir
 
     @staticmethod
-    def _prepare_label_map(label_map: torch.Tensor, out_hw: Tuple[int, int]) -> torch.Tensor:
+    def _prepare_label_map(
+        label_map: torch.Tensor,
+        out_hw: Tuple[int, int],
+    ) -> torch.Tensor:
         x = label_map.detach().cpu()
         if x.dim() == 3:
             if x.shape[0] != 1:
@@ -811,7 +799,6 @@ class VisualizationManager:
             sample_dir: Path,
             semantic_scores: torch.Tensor,
             final_scores: torch.Tensor,
-            suppression_logits: Optional[torch.Tensor],
             extra_token_aux_logits: Optional[torch.Tensor],
             class_names: Optional[List[str]],
     ) -> None:
@@ -832,8 +819,6 @@ class VisualizationManager:
 
         semantic_max, semantic_mean = self._per_class_max_mean(semantic_scores)
         final_max, final_mean = self._per_class_max_mean(final_scores)
-
-        suppression_max, suppression_mean = self._per_class_max_mean(suppression_logits)
         extra_aux_max, extra_aux_mean = self._per_class_max_mean(extra_token_aux_logits)
 
         order = torch.argsort(final_max, descending=True)
@@ -843,7 +828,6 @@ class VisualizationManager:
                 "rank\tclass_id\tclass_name\t"
                 "semantic_max\tsemantic_mean\t"
                 "final_max\tfinal_mean\t"
-                "suppression_logit_max\tsuppression_logit_mean\t"
                 "extra_token_aux_logit_max\textra_token_aux_logit_mean\n"
             )
 
@@ -854,16 +838,6 @@ class VisualizationManager:
                     else f"class_{cls_idx}"
                 )
 
-                suppression_max_value = (
-                    float(suppression_max[cls_idx].item())
-                    if suppression_max is not None
-                    else None
-                )
-                suppression_mean_value = (
-                    float(suppression_mean[cls_idx].item())
-                    if suppression_mean is not None
-                    else None
-                )
                 extra_aux_max_value = (
                     float(extra_aux_max[cls_idx].item())
                     if extra_aux_max is not None
@@ -881,8 +855,6 @@ class VisualizationManager:
                     f"{float(semantic_mean[cls_idx].item()):.6f}\t"
                     f"{float(final_max[cls_idx].item()):.6f}\t"
                     f"{float(final_mean[cls_idx].item()):.6f}\t"
-                    f"{self._format_optional_float(suppression_max_value)}\t"
-                    f"{self._format_optional_float(suppression_mean_value)}\t"
                     f"{self._format_optional_float(extra_aux_max_value)}\t"
                     f"{self._format_optional_float(extra_aux_mean_value)}\n"
                 )
@@ -892,7 +864,6 @@ class VisualizationManager:
             sample_dir: Path,
             semantic_scores: torch.Tensor,
             final_scores: torch.Tensor,
-            suppression_logits: Optional[torch.Tensor],
             extra_token_aux_logits: Optional[torch.Tensor],
             out_hw: Tuple[int, int],
             class_names: Optional[List[str]],
@@ -913,19 +884,16 @@ class VisualizationManager:
                 f"semantic={num_classes}, final={final_scores.shape[0]}."
             )
 
-        for key, value in (
-                ("suppression_logits", suppression_logits),
-                ("extra_token_aux_logits", extra_token_aux_logits),
-        ):
-            if value is None:
-                continue
-            if value.dim() != 3:
+        if extra_token_aux_logits is not None:
+            if extra_token_aux_logits.dim() != 3:
                 raise ValueError(
-                    f"Expected {key} as [C, H, W], got {tuple(value.shape)}."
+                    "Expected extra_token_aux_logits as [C, H, W], "
+                    f"got {tuple(extra_token_aux_logits.shape)}."
                 )
-            if value.shape[0] != num_classes:
+            if extra_token_aux_logits.shape[0] != num_classes:
                 raise ValueError(
-                    f"{key} class count mismatch: {value.shape[0]} vs {num_classes}."
+                    "extra_token_aux_logits class count mismatch: "
+                    f"{extra_token_aux_logits.shape[0]} vs {num_classes}."
                 )
 
         final_max = final_scores.flatten(1).max(dim=1).values
@@ -938,7 +906,7 @@ class VisualizationManager:
             f.write(
                 "rank\tclass_id\tclass_name\t"
                 "semantic_max\tfinal_max\t"
-                "has_suppression_logits\thas_extra_token_aux_logits\n"
+                "has_extra_token_aux_logits\n"
             )
 
             for rank, cls_idx in enumerate(order.tolist()):
@@ -960,7 +928,6 @@ class VisualizationManager:
                     f"{rank}\t{cls_idx}\t{class_name}\t"
                     f"{semantic_max_value:.6f}\t"
                     f"{final_max_value:.6f}\t"
-                    f"{int(suppression_logits is not None)}\t"
                     f"{int(extra_token_aux_logits is not None)}\n"
                 )
 
@@ -985,20 +952,6 @@ class VisualizationManager:
                 )
 
                 if (
-                        self.cfg.save_suppression_heatmaps
-                        and suppression_logits is not None
-                ):
-                    suppression_img = self._to_heatmap_image(
-                        suppression_logits[cls_idx],
-                        out_hw=out_hw,
-                        normalize="minmax",
-                    )
-                    suppression_img.save(
-                        heatmap_dir
-                        / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_suppression_logits.png"
-                    )
-
-                if (
                         self.cfg.save_extra_token_aux_heatmaps
                         and extra_token_aux_logits is not None
                 ):
@@ -1011,57 +964,6 @@ class VisualizationManager:
                         heatmap_dir
                         / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_extra_token_aux_logits.png"
                     )
-
-    def _save_clip_score_heatmaps(
-            self,
-            sample_dir: Path,
-            clip_scores: torch.Tensor,
-            out_hw: Tuple[int, int],
-            class_names: Optional[List[str]],
-    ) -> None:
-        if clip_scores.dim() != 3:
-            raise ValueError(
-                f"Expected clip_scores as [C, H, W], got {tuple(clip_scores.shape)}."
-            )
-
-        clip_max = clip_scores.flatten(1).max(dim=1).values
-        clip_mean = clip_scores.flatten(1).mean(dim=1)
-
-        order = torch.argsort(clip_max, descending=True)
-
-        heatmap_dir = sample_dir / "clip_score_heatmaps"
-        heatmap_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(heatmap_dir / "all_classes.txt", "w", encoding="utf-8") as f:
-            f.write("rank\tclass_id\tclass_name\tclip_max\tclip_mean\n")
-
-            for rank, cls_idx in enumerate(order.tolist()):
-                class_name = (
-                    class_names[cls_idx]
-                    if class_names is not None and cls_idx < len(class_names)
-                    else f"class_{cls_idx}"
-                )
-
-                clip_max_value = float(clip_max[cls_idx].item())
-                clip_mean_value = float(clip_mean[cls_idx].item())
-
-                f.write(
-                    f"{rank}\t{cls_idx}\t{class_name}\t"
-                    f"{clip_max_value:.6f}\t"
-                    f"{clip_mean_value:.6f}\n"
-                )
-
-                safe_name = self._sanitize_filename(class_name)
-
-                clip_img = self._to_heatmap_image(
-                    clip_scores[cls_idx],
-                    out_hw=out_hw,
-                    normalize="minmax",
-                )
-                clip_img.save(
-                    heatmap_dir
-                    / f"rank_{rank:03d}_class_{cls_idx:03d}_{safe_name}_clip_score.png"
-                )
 
     def _get_epoch_key(self, stage: str, epoch: Optional[int]) -> Tuple[str, int]:
         return stage, (-1 if epoch is None else int(epoch))

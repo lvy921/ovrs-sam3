@@ -29,9 +29,6 @@ class SemanticCriterionConfig:
     extra_token_aux_exclude_bg: bool = True
     extra_token_aux_bg_idx: int = 0
 
-    suppression_absent_loss_weight: float = 0.05
-    suppression_absent_topk_ratio: float = 0.05
-
     bce_class_balance_clamp_min: float = 0.2
     bce_class_balance_clamp_max: float = 5.0
     eps: float = 1e-6
@@ -112,7 +109,6 @@ class SemanticCriterion(nn.Module):
         ref: torch.Tensor,
         include_extra_aux: bool = True,
         include_final: bool = True,
-        include_suppression: bool = True,
     ) -> Dict[str, torch.Tensor]:
         zero = ref.sum() * 0.0
 
@@ -139,9 +135,6 @@ class SemanticCriterion(nn.Module):
                     "loss_extra_token_aux": zero,
                 }
             )
-
-        if include_suppression:
-            losses["loss_suppression_absent"] = zero
 
         return losses
 
@@ -424,32 +417,6 @@ class SemanticCriterion(nn.Module):
             "loss_extra_token_aux": loss_extra_token_aux,
         }
 
-    def _suppression_absent_loss(
-        self,
-        suppression_logits: Optional[torch.Tensor],
-        present_pair_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        ref = suppression_logits if suppression_logits is not None else present_pair_mask.float()
-        zero = ref.sum() * 0.0
-
-        if suppression_logits is None:
-            return zero
-
-        absent_pair_mask = ~present_pair_mask
-        if not absent_pair_mask.any():
-            return zero
-
-        absent_logits = suppression_logits[absent_pair_mask].flatten(1)
-
-        topk_ratio = max(
-            0.0,
-            min(1.0, float(self.cfg.suppression_absent_topk_ratio)),
-        )
-        topk = max(1, int(absent_logits.shape[1] * topk_ratio))
-
-        top_logits = absent_logits.topk(k=topk, dim=1).values
-        return F.softplus(top_logits).mean()
-
     def _forward_chunk(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -551,7 +518,6 @@ class SemanticCriterion(nn.Module):
                 "loss_extra_token_aux_absent"
             ],
             "loss_extra_token_aux": extra_aux_losses["loss_extra_token_aux"],
-            "loss_suppression_absent": zero_losses["loss_suppression_absent"],
             "total_loss": total_loss,
             "num_valid": torch.tensor(
                 num_valid_pixels,
@@ -573,22 +539,11 @@ class SemanticCriterion(nn.Module):
             outputs,
             OUTPUT_KEYS.final_logits,
         )
-        suppression_logits = self._extract_required_logits(
-            outputs,
-            OUTPUT_KEYS.suppression_logits,
-        )
 
         if final_logits.shape != semantic_logits.shape:
             raise ValueError(
                 "final_logits and semantic_logits must have the same shape, "
                 f"got {tuple(final_logits.shape)} and {tuple(semantic_logits.shape)}."
-            )
-
-        if suppression_logits.shape != semantic_logits.shape:
-            raise ValueError(
-                "suppression_logits and semantic_logits must have the same shape, "
-                f"got {tuple(suppression_logits.shape)} and "
-                f"{tuple(semantic_logits.shape)}."
             )
 
         label_map = self._extract_label_map(targets)
@@ -657,20 +612,10 @@ class SemanticCriterion(nn.Module):
             ce_label_map=ce_label_map,
         )
 
-        raw_loss_suppression_absent = self._suppression_absent_loss(
-            suppression_logits=suppression_logits,
-            present_pair_mask=present_pair_mask,
-        )
-        loss_suppression_absent = (
-            float(self.cfg.suppression_absent_loss_weight)
-            * raw_loss_suppression_absent
-        )
-
         total_loss = (
             float(self.cfg.final_bce_weight) * loss_final_bce
             + float(self.cfg.final_dice_weight) * loss_final_dice
             + float(self.cfg.final_ce_weight) * loss_final_ce
-            + loss_suppression_absent
         )
 
         return {
@@ -685,7 +630,6 @@ class SemanticCriterion(nn.Module):
                 "loss_extra_token_aux_absent"
             ],
             "loss_extra_token_aux": zero_losses["loss_extra_token_aux"],
-            "loss_suppression_absent": raw_loss_suppression_absent,
             "total_loss": total_loss,
             "num_valid": torch.tensor(
                 max(num_valid_pixels, num_ce_valid),
@@ -706,10 +650,7 @@ class SemanticCriterion(nn.Module):
                 f"SemanticCriterion only supports reduction='mean', got {reduction!r}."
             )
 
-        is_final_stage = (
-            OUTPUT_KEYS.final_logits in outputs
-            and OUTPUT_KEYS.suppression_logits in outputs
-        )
+        is_final_stage = OUTPUT_KEYS.final_logits in outputs
 
         if is_final_stage:
             return self._forward_final(

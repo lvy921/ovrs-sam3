@@ -85,13 +85,24 @@ def build_log_getters(cfg) -> List[object]:
         model = getattr(model, "module", model)
         core = getattr(model, "core", None)
 
-        if core is not None and hasattr(core, "suppression_gate_bias"):
-            bias = core.suppression_gate_bias.detach()
-            out["suppression_gate_bias"] = float(bias.item())
+        if core is None:
+            return out
 
-        if core is not None and hasattr(core, "suppression_logit_scale"):
-            scale = core.suppression_logit_scale.detach()
-            out["suppression_logit_scale"] = float(scale.item())
+        feature_builder = getattr(
+            core,
+            "global_clip_sam_feature_builder",
+            None,
+        )
+        if feature_builder is None:
+            return out
+
+        alpha = getattr(feature_builder, "alpha", None)
+        if alpha is not None:
+            alpha = alpha.detach()
+            if alpha.numel() == 1:
+                out["clip_sam_feature_alpha"] = float(alpha.item())
+            else:
+                out["clip_sam_feature_alpha_mean"] = float(alpha.float().mean().item())
 
         return out
 

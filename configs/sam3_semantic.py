@@ -37,25 +37,24 @@ model = dict(
 
     final_mixer_cfg=dict(
         enabled=True,
-        hidden_dim=128,
+        score_dim=32,
+        class_dim=128,
+        attn_dim=160,
         num_heads=8,
+        fusion_layers=2,
         dropout=0.1,
-        gate_bias_init=3.0,
-
-        class_attn_heads=4,
-        class_attn_pooling_size=2,
+        clip_feature_dim=256,
+        use_final_residual=True,
+        clip_residual_init=1.0,
     ),
 
     freeze_cfg=dict(
         train_adapters_only=True,
         trainable_modules=[
-            "core.clip_native_image_to_text_attn",
-            "core.clip_native_image_to_text_norm",
+            "core.global_clip_sam_feature_builder",
 
-            "core.clip_hv_proj",
-
-            "core.sam3_to_clip_hv_attn",
-            "core.sam3_to_clip_hv_norm",
+            "core.sam3_to_clip_feature_attn",
+            "core.sam3_to_clip_feature_norm",
 
             "core.extra_type_embed",
 
@@ -66,17 +65,8 @@ model = dict(
             "core.class_query_seed_proj",
             "core.class_query_encoder_cross_attn",
             "core.class_query_encoder_cross_attn_norm",
-            "core.class_query_proj",
 
-            "core.class_query_self_attn",
-            "core.class_query_self_attn_norm",
-
-            "core.score_fusion_block",
-
-            "core.suppression_query_cross_attn",
-            "core.suppression_query_cross_attn_norm",
-            "core.suppression_logit_scale",
-            "core.suppression_gate_bias",
+            "core.final_mixer",
         ],
         frozen_modules=[],
     ),
@@ -89,9 +79,9 @@ model = dict(
         bce_weight=0.4,
         dice_weight=1.0,
 
-        final_bce_weight=0.1,
-        final_dice_weight=0.5,
-        final_ce_weight=0.1,
+        final_bce_weight=0.2,
+        final_dice_weight=0.6,
+        final_ce_weight=0.8,
 
         extra_token_aux_loss_weight=0.1,
         extra_token_aux_bce_weight=0.3,
@@ -100,9 +90,6 @@ model = dict(
         extra_token_aux_absent_topk_ratio=0.05,
         extra_token_aux_exclude_bg=False,
         extra_token_aux_bg_idx=0,
-
-        suppression_absent_loss_weight=0.5,
-        suppression_absent_topk_ratio=0.05,
 
         bce_class_balance_clamp_min=0.2,
         bce_class_balance_clamp_max=5.0,
@@ -136,13 +123,10 @@ optim_wrapper = dict(
         paramwise_cfg=dict(
             norm_decay_mult=0.0,
             custom_keys={
-                "core.clip_native_image_to_text_attn": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.clip_native_image_to_text_norm": dict(lr_mult=2.0, decay_mult=0.0),
+                "core.global_clip_sam_feature_builder": dict(lr_mult=2.0, decay_mult=1.0),
 
-                "core.clip_hv_proj": dict(lr_mult=2.0, decay_mult=1.0),
-
-                "core.sam3_to_clip_hv_attn": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.sam3_to_clip_hv_norm": dict(lr_mult=2.0, decay_mult=0.0),
+                "core.sam3_to_clip_feature_attn": dict(lr_mult=2.0, decay_mult=1.0),
+                "core.sam3_to_clip_feature_norm": dict(lr_mult=2.0, decay_mult=0.0),
 
                 "core.extra_type_embed": dict(lr_mult=2.0, decay_mult=0.0),
                 "core.extra_token_mask_query_proj": dict(lr_mult=3.0, decay_mult=1.0),
@@ -152,17 +136,8 @@ optim_wrapper = dict(
                 "core.class_query_seed_proj": dict(lr_mult=2.0, decay_mult=1.0),
                 "core.class_query_encoder_cross_attn": dict(lr_mult=2.0, decay_mult=1.0),
                 "core.class_query_encoder_cross_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
-                "core.class_query_proj": dict(lr_mult=2.0, decay_mult=1.0),
 
-                "core.class_query_self_attn": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.class_query_self_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
-
-                "core.score_fusion_block": dict(lr_mult=2.0, decay_mult=1.0),
-
-                "core.suppression_query_cross_attn": dict(lr_mult=2.0, decay_mult=1.0),
-                "core.suppression_query_cross_attn_norm": dict(lr_mult=2.0, decay_mult=0.0),
-                "core.suppression_logit_scale": dict(lr_mult=1.0, decay_mult=0.0),
-                "core.suppression_gate_bias": dict(lr_mult=1.0, decay_mult=0.0),
+                "core.final_mixer": dict(lr_mult=2.0, decay_mult=1.0),
             }
         ),
     )
@@ -172,26 +147,26 @@ param_scheduler = [
     dict(
         type="LinearLR",
         start_factor=0.1,
-        total_iters=500,
+        total_iters=1000,
         end=0,
     ),
     dict(
         type="CosineAnnealingLR",
-        T_max=9500,
+        T_max=19000,
         eta_min=1e-6,
     )
 ]
 
 train_cfg = dict(
-    max_iters=10000,
+    max_iters=20000,
     save_interval=1000,
-    eval_interval=10000,
+    eval_interval=20000,
     log_window_size=20,
     use_amp=True,
     grad_clip_norm=0.1,
     monitor="semantic.miou",
     monitor_mode="max",
-    max_keep_ckpts=10,
+    max_keep_ckpts=20,
     auto_resume=False,
     device="cuda",
 )

@@ -6,251 +6,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .clip_sam_feature import GlobalClipSamFeatureBuilder
 from .data_misc import BatchedDatapoint, FindStage
+from .final_mixer import ClassQuerySemanticFinalMixer
 from .geometry_encoders import Prompt
 from .task_modes import OUTPUT_KEYS, TASK_MODE_SEMANTIC, normalize_task_mode
 from .vl_combiner import SAM3VLBackbone
-
-def _choose_group_norm_groups(num_channels: int, preferred_groups: int = 8) -> int:
-    for groups in (preferred_groups, 4, 2, 1):
-        if groups <= num_channels and num_channels % groups == 0:
-            return groups
-    return 1
-
-
-class BranchEmbeddingScoreFusion(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int = 128,
-        norm_groups: int = 8,
-        class_attn_heads: int = 4,
-        class_attn_pooling_size: int = 2,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        self.hidden_dim = int(hidden_dim)
-        self.class_attn_heads = int(class_attn_heads)
-        self.class_attn_pooling_size = int(class_attn_pooling_size)
-
-        if self.hidden_dim <= 0:
-            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}.")
-        if self.class_attn_heads <= 0:
-            raise ValueError(
-                f"class_attn_heads must be positive, got {class_attn_heads}."
-            )
-        if self.hidden_dim % self.class_attn_heads != 0:
-            raise ValueError(
-                "hidden_dim must be divisible by class_attn_heads, "
-                f"got hidden_dim={self.hidden_dim}, "
-                f"class_attn_heads={self.class_attn_heads}."
-            )
-
-        groups = _choose_group_norm_groups(
-            num_channels=self.hidden_dim,
-            preferred_groups=int(norm_groups),
-        )
-
-        self.sam_score_embed = nn.Sequential(
-            nn.Conv2d(1, self.hidden_dim, kernel_size=7, padding=3),
-            nn.GroupNorm(groups, self.hidden_dim),
-            nn.GELU(),
-        )
-
-        self.clip_score_embed = nn.Sequential(
-            nn.Conv2d(1, self.hidden_dim, kernel_size=7, padding=3),
-            nn.GroupNorm(groups, self.hidden_dim),
-            nn.GELU(),
-        )
-
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(
-                2 * self.hidden_dim,
-                self.hidden_dim,
-                kernel_size=7,
-                padding=3,
-            ),
-            nn.GroupNorm(groups, self.hidden_dim),
-            nn.GELU(),
-            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1),
-        )
-
-        self.class_attn_norm = nn.LayerNorm(self.hidden_dim)
-        self.class_attn = nn.MultiheadAttention(
-            embed_dim=self.hidden_dim,
-            num_heads=self.class_attn_heads,
-            dropout=float(dropout),
-            batch_first=True,
-        )
-
-        self.class_ffn_norm = nn.LayerNorm(self.hidden_dim)
-        self.class_ffn = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim * 4),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(self.hidden_dim * 4, self.hidden_dim),
-        )
-
-    def _pool_fused_memory(
-        self,
-        fused_memory: torch.Tensor,
-    ) -> torch.Tensor:
-        pooling_size = int(self.class_attn_pooling_size)
-        if pooling_size <= 1:
-            return fused_memory
-
-        batch_size, num_classes, hidden_dim, height, width = fused_memory.shape
-
-        if height < pooling_size or width < pooling_size:
-            return fused_memory
-
-        x = fused_memory.reshape(
-            batch_size * num_classes,
-            hidden_dim,
-            height,
-            width,
-        )
-
-        x = F.avg_pool2d(
-            x,
-            kernel_size=pooling_size,
-            stride=pooling_size,
-        )
-
-        pooled_h, pooled_w = int(x.shape[-2]), int(x.shape[-1])
-        return x.reshape(
-            batch_size,
-            num_classes,
-            hidden_dim,
-            pooled_h,
-            pooled_w,
-        )
-
-    def _run_pooled_class_attention(
-        self,
-        fused_memory: torch.Tensor,
-        target_hw: tuple[int, int],
-    ) -> torch.Tensor:
-        batch_size, num_classes, hidden_dim, pooled_h, pooled_w = fused_memory.shape
-
-        x = fused_memory.permute(0, 3, 4, 1, 2).contiguous()
-        x = x.reshape(
-            batch_size * pooled_h * pooled_w,
-            num_classes,
-            hidden_dim,
-        )
-
-        attn_in = self.class_attn_norm(x)
-        attn_out, _ = self.class_attn(
-            query=attn_in,
-            key=attn_in,
-            value=attn_in,
-            need_weights=False,
-        )
-        x = x + attn_out
-
-        ffn_in = self.class_ffn_norm(x)
-        x = x + self.class_ffn(ffn_in)
-
-        x = x.reshape(
-            batch_size,
-            pooled_h,
-            pooled_w,
-            num_classes,
-            hidden_dim,
-        )
-        x = x.permute(0, 3, 4, 1, 2).contiguous()
-
-        target_h, target_w = int(target_hw[0]), int(target_hw[1])
-        if (pooled_h, pooled_w) == (target_h, target_w):
-            return x
-
-        x = x.reshape(
-            batch_size * num_classes,
-            hidden_dim,
-            pooled_h,
-            pooled_w,
-        )
-        x = F.interpolate(
-            x,
-            size=(target_h, target_w),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return x.reshape(
-            batch_size,
-            num_classes,
-            hidden_dim,
-            target_h,
-            target_w,
-        )
-
-    def forward(
-        self,
-        semantic_logits: torch.Tensor,
-        clip_dense_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        if semantic_logits.dim() != 4:
-            raise ValueError(
-                f"semantic_logits must be [B, C, H, W], "
-                f"got {tuple(semantic_logits.shape)}."
-            )
-        if clip_dense_logits.dim() != 4:
-            raise ValueError(
-                f"clip_dense_logits must be [B, C, H, W], "
-                f"got {tuple(clip_dense_logits.shape)}."
-            )
-        if semantic_logits.shape != clip_dense_logits.shape:
-            raise ValueError(
-                "semantic_logits and clip_dense_logits must have the same shape, "
-                f"got {tuple(semantic_logits.shape)} and "
-                f"{tuple(clip_dense_logits.shape)}."
-            )
-
-        batch_size, num_classes, height, width = semantic_logits.shape
-
-        sam_input = semantic_logits.reshape(batch_size * num_classes, 1, height, width)
-        clip_input = clip_dense_logits.reshape(batch_size * num_classes, 1, height, width)
-
-        sam_embed = self.sam_score_embed(sam_input)
-        clip_embed = self.clip_score_embed(clip_input)
-
-        fused = torch.cat([sam_embed, clip_embed], dim=1)
-        fused = self.fusion_conv(fused)
-
-        # Anchor the fused feature to SAM3 boundary-aware score features.
-        fused = fused + sam_embed
-
-        fused_memory = fused.reshape(
-            batch_size,
-            num_classes,
-            self.hidden_dim,
-            height,
-            width,
-        )
-
-        pooled_memory = self._pool_fused_memory(fused_memory)
-        class_delta = self._run_pooled_class_attention(
-            fused_memory=pooled_memory,
-            target_hw=(height, width),
-        )
-
-        fused_memory = fused_memory + class_delta
-
-        if fused_memory.shape[:2] != semantic_logits.shape[:2]:
-            raise RuntimeError(
-                "fused_memory batch/class shape mismatch: "
-                f"{tuple(fused_memory.shape[:2])} vs "
-                f"{tuple(semantic_logits.shape[:2])}."
-            )
-        if fused_memory.shape[-2:] != semantic_logits.shape[-2:]:
-            raise RuntimeError(
-                "fused_memory spatial shape mismatch: "
-                f"{tuple(fused_memory.shape[-2:])} vs "
-                f"{tuple(semantic_logits.shape[-2:])}."
-            )
-
-        return fused_memory
 
 class Sam3Image(torch.nn.Module):
     def __init__(
@@ -344,64 +105,65 @@ class Sam3Image(torch.nn.Module):
                 )
             self.clip_align_dim = self.clip_text_dim
 
-        self.clip_native_image_to_text_attn = None
-        self.clip_native_image_to_text_norm = None
-        self.clip_hv_proj = None
-        self.sam3_to_clip_hv_attn = None
-        self.sam3_to_clip_hv_norm = None
+        self.global_clip_sam_feature_builder = None
+        self.sam3_to_clip_feature_attn = None
+        self.sam3_to_clip_feature_norm = None
         self.extra_type_embed = None
         self.extra_token_mask_query_proj = None
         self.extra_token_mask_memory_proj = None
         self.extra_token_logit_scale = None
 
-        if self.clip_align_dim is not None:
-            self.clip_native_image_to_text_attn = nn.MultiheadAttention(
-                embed_dim=self.clip_align_dim,
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True,
-            )
-            self.clip_native_image_to_text_norm = nn.LayerNorm(self.clip_align_dim)
-            self.clip_hv_proj = nn.Linear(self.clip_align_dim, self.hidden_dim)
+        self.final_mixer_dropout = float(
+            getattr(final_mixer_cfg, "dropout", 0.1)
+        )
+        self.final_mixer_num_heads = int(
+            getattr(final_mixer_cfg, "num_heads", 8)
+        )
+        self.final_mixer_score_dim = int(
+            getattr(final_mixer_cfg, "score_dim", 32)
+        )
+        self.final_mixer_class_dim = int(
+            getattr(final_mixer_cfg, "class_dim", 128)
+        )
+        self.final_mixer_attn_dim = int(
+            getattr(final_mixer_cfg, "attn_dim", 160)
+        )
+        self.final_mixer_fusion_layers = int(
+            getattr(final_mixer_cfg, "fusion_layers", 2)
+        )
+        self.final_mixer_clip_feature_dim = int(
+            getattr(final_mixer_cfg, "clip_feature_dim", self.hidden_dim)
+        )
+        self.final_mixer_use_final_residual = bool(
+            getattr(final_mixer_cfg, "use_final_residual", True)
+        )
+        self.clip_residual_init = float(
+            getattr(final_mixer_cfg, "clip_residual_init", 0.1)
+        )
 
-            self.sam3_to_clip_hv_attn = nn.MultiheadAttention(
+        if self.clip_align_dim is not None:
+            self.global_clip_sam_feature_builder = GlobalClipSamFeatureBuilder(
+                clip_dim=self.clip_align_dim,
+                sam_dim=self.hidden_dim,
+                clip_feature_dim=self.final_mixer_clip_feature_dim,
+                attn_dim=self.clip_align_dim,
+                num_heads=self.final_mixer_num_heads,
+                dropout=self.final_mixer_dropout,
+                residual_init=self.clip_residual_init,
+            )
+
+            self.sam3_to_clip_feature_attn = nn.MultiheadAttention(
                 embed_dim=self.hidden_dim,
                 num_heads=8,
                 dropout=0.1,
                 batch_first=True,
             )
-            self.sam3_to_clip_hv_norm = nn.LayerNorm(self.hidden_dim)
+            self.sam3_to_clip_feature_norm = nn.LayerNorm(self.hidden_dim)
             self.extra_type_embed = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
 
             self.extra_token_mask_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
             self.extra_token_mask_memory_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
             self.extra_token_logit_scale = nn.Parameter(torch.tensor(2.3, dtype=torch.float32))
-
-        self.final_mixer_hidden_dim = int(
-            getattr(final_mixer_cfg, "hidden_dim", 128)
-        )
-        self.final_mixer_num_heads = int(
-            getattr(final_mixer_cfg, "num_heads", 8)
-        )
-        self.final_mixer_dropout = float(
-            getattr(final_mixer_cfg, "dropout", 0.1)
-        )
-        gate_bias_init = float(
-            getattr(final_mixer_cfg, "gate_bias_init", 3.0)
-        )
-        self.final_mixer_class_attn_heads = int(
-            getattr(final_mixer_cfg, "class_attn_heads", 4)
-        )
-        self.final_mixer_class_attn_pooling_size = int(
-            getattr(final_mixer_cfg, "class_attn_pooling_size", 2)
-        )
-
-        if self.final_mixer_hidden_dim % self.final_mixer_num_heads != 0:
-            raise ValueError(
-                "final_mixer_hidden_dim must be divisible by final_mixer_num_heads, "
-                f"got hidden_dim={self.final_mixer_hidden_dim}, "
-                f"num_heads={self.final_mixer_num_heads}."
-            )
 
         self.class_query_seed_proj = nn.Linear(self.hidden_dim * 3, self.hidden_dim)
         nn.init.xavier_uniform_(self.class_query_seed_proj.weight)
@@ -415,37 +177,16 @@ class Sam3Image(torch.nn.Module):
         )
         self.class_query_encoder_cross_attn_norm = nn.LayerNorm(self.hidden_dim)
 
-        if self.final_mixer_hidden_dim == self.hidden_dim:
-            self.class_query_proj = nn.Identity()
-        else:
-            self.class_query_proj = nn.Linear(self.hidden_dim, self.final_mixer_hidden_dim)
-
-        self.class_query_self_attn = nn.MultiheadAttention(
-            embed_dim=self.final_mixer_hidden_dim,
+        self.final_mixer = ClassQuerySemanticFinalMixer(
+            sam_dim=self.hidden_dim,
+            score_dim=self.final_mixer_score_dim,
+            class_dim=self.final_mixer_class_dim,
+            attn_dim=self.final_mixer_attn_dim,
             num_heads=self.final_mixer_num_heads,
+            fusion_layers=self.final_mixer_fusion_layers,
             dropout=self.final_mixer_dropout,
-            batch_first=True,
+            use_final_residual=self.final_mixer_use_final_residual,
         )
-        self.class_query_self_attn_norm = nn.LayerNorm(self.final_mixer_hidden_dim)
-
-        self.score_fusion_block = BranchEmbeddingScoreFusion(
-            hidden_dim=self.final_mixer_hidden_dim,
-            norm_groups=8,
-            class_attn_heads=self.final_mixer_class_attn_heads,
-            class_attn_pooling_size=self.final_mixer_class_attn_pooling_size,
-            dropout=self.final_mixer_dropout,
-        )
-
-        self.suppression_query_cross_attn = nn.MultiheadAttention(
-            embed_dim=self.final_mixer_hidden_dim,
-            num_heads=self.final_mixer_num_heads,
-            dropout=self.final_mixer_dropout,
-            batch_first=True,
-        )
-        self.suppression_query_cross_attn_norm = nn.LayerNorm(self.final_mixer_hidden_dim)
-
-        self.suppression_logit_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.suppression_gate_bias = nn.Parameter(torch.tensor(gate_bias_init, dtype=torch.float32))
 
         self.prompt_chunk_size = None
         self._text_cache: Optional[Dict[str, torch.Tensor]] = None
@@ -634,6 +375,122 @@ class Sam3Image(torch.nn.Module):
             "clip_image_grid_hw": (int(clip_feat_map.shape[-2]), int(clip_feat_map.shape[-1])),
         }
 
+    def build_shared_clip_feature(
+        self,
+        input: BatchedDatapoint,
+    ) -> torch.Tensor:
+        if self.global_clip_sam_feature_builder is None:
+            raise RuntimeError(
+                "global_clip_sam_feature_builder is not initialized. "
+                "Check openclip_cfg.enabled and OpenCLIP encoder setup."
+            )
+
+        device = self.device
+        class_texts = list(input.find_text_batch)
+        if len(class_texts) == 0:
+            raise ValueError("find_text_batch is empty.")
+
+        self.ensure_text_cache(class_texts=class_texts, device=device)
+
+        if self._text_cache is None:
+            raise RuntimeError("Text cache is not prepared.")
+        if "clip_text_tokens_native" not in self._text_cache:
+            raise ValueError(
+                "clip_text_tokens_native is missing. "
+                "Check openclip_cfg.extra_token_templates."
+            )
+
+        clip_image_cache = self._build_clip_image_cache(input=input, device=device)
+        if clip_image_cache is None:
+            raise ValueError(
+                "clip_image_cache is None. "
+                "Current semantic pipeline expects OpenCLIP image features."
+            )
+
+        return self.global_clip_sam_feature_builder(
+            clip_image_feat_map_native=clip_image_cache["clip_image_feat_map_native"],
+            clip_text_tokens_native=self._text_cache["clip_text_tokens_native"],
+            sam3_text_tokens_full=self._text_cache["language_features"],
+            sam3_text_mask_full=self._text_cache["language_mask"],
+        )
+
+    def _build_extra_tokens_from_shared_clip_feature(
+        self,
+        shared_clip_feature: torch.Tensor,
+        sam3_text_tokens: torch.Tensor,
+        sam3_text_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if (
+            self.sam3_to_clip_feature_attn is None
+            or self.sam3_to_clip_feature_norm is None
+            or self.extra_type_embed is None
+        ):
+            raise RuntimeError("Shared CLIP feature extra token modules are not initialized.")
+
+        if shared_clip_feature.dim() != 3:
+            raise ValueError(
+                "shared_clip_feature must be [B, N_clip, D_sam], "
+                f"got {tuple(shared_clip_feature.shape)}."
+            )
+        if sam3_text_tokens.dim() != 3:
+            raise ValueError(
+                "sam3_text_tokens must be [B*C_chunk, M, D_sam], "
+                f"got {tuple(sam3_text_tokens.shape)}."
+            )
+
+        batch_size, num_clip_tokens, clip_feature_dim = shared_clip_feature.shape
+        pair_count, _, sam_dim = sam3_text_tokens.shape
+
+        if int(clip_feature_dim) != self.hidden_dim:
+            raise ValueError(
+                f"shared_clip_feature dim mismatch: expected {self.hidden_dim}, "
+                f"got {clip_feature_dim}."
+            )
+        if int(sam_dim) != self.hidden_dim:
+            raise ValueError(
+                f"sam3_text_tokens dim mismatch: expected {self.hidden_dim}, "
+                f"got {sam_dim}."
+            )
+        if pair_count % batch_size != 0:
+            raise ValueError(
+                "sam3_text_tokens first dim must be divisible by batch size: "
+                f"pair_count={pair_count}, batch_size={batch_size}."
+            )
+
+        num_chunk_classes = pair_count // batch_size
+
+        clip_pair = shared_clip_feature[:, None].expand(
+            batch_size,
+            num_chunk_classes,
+            num_clip_tokens,
+            self.hidden_dim,
+        )
+        clip_pair = clip_pair.reshape(
+            pair_count,
+            num_clip_tokens,
+            self.hidden_dim,
+        ).contiguous()
+        clip_pair = clip_pair.to(
+            device=sam3_text_tokens.device,
+            dtype=sam3_text_tokens.dtype,
+        )
+
+        extra_delta, _ = self.sam3_to_clip_feature_attn(
+            query=sam3_text_tokens,
+            key=clip_pair,
+            value=clip_pair,
+            need_weights=False,
+        )
+
+        extra_tokens = self.sam3_to_clip_feature_norm(
+            sam3_text_tokens + extra_delta
+        )
+
+        return extra_tokens + self.extra_type_embed.to(
+            device=extra_tokens.device,
+            dtype=extra_tokens.dtype,
+        )
+
     def _expand_sam3_text_to_pairs(
         self,
         sam3_text_feats: torch.Tensor,
@@ -649,112 +506,6 @@ class Sam3Image(torch.nn.Module):
         mask = sam3_text_mask.unsqueeze(0).expand(batch_size, num_classes, seq_len)
         mask = mask.reshape(batch_size * num_classes, seq_len).contiguous()
         return feats, mask
-
-    def _build_clip_hv_native(
-            self,
-            clip_image_feat_map_native: torch.Tensor,
-            clip_text_tokens_native: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.clip_native_image_to_text_attn is None or self.clip_native_image_to_text_norm is None:
-            raise RuntimeError("OpenCLIP native attention modules are not initialized.")
-
-        batch_size, image_dim, grid_h, grid_w = clip_image_feat_map_native.shape
-        num_classes, num_templates, text_dim = clip_text_tokens_native.shape
-
-        if image_dim != text_dim:
-            raise ValueError(f"CLIP image/text dim mismatch: {image_dim} vs {text_dim}.")
-
-        device = clip_image_feat_map_native.device
-        dtype = clip_image_feat_map_native.dtype
-        clip_text_tokens_native = clip_text_tokens_native.to(device=device, dtype=dtype)
-
-        num_clip_tokens = int(grid_h) * int(grid_w)
-
-        # [B, D_clip, Hc, Wc] -> [B, N_clip, D_clip]
-        image_tokens = clip_image_feat_map_native.flatten(2).transpose(1, 2).contiguous()
-
-        image_tokens = F.normalize(image_tokens, dim=-1, eps=1e-6)
-        clip_text_tokens_native = F.normalize(
-            clip_text_tokens_native,
-            dim=-1,
-            eps=1e-6,
-        )
-
-        # [B, N_clip, D_clip] -> [B*C_chunk, N_clip, D_clip]
-        query = image_tokens[:, None].expand(
-            batch_size,
-            num_classes,
-            num_clip_tokens,
-            image_dim,
-        )
-        query = query.reshape(
-            batch_size * num_classes,
-            num_clip_tokens,
-            image_dim,
-        ).contiguous()
-
-        # [C_chunk, K, D_clip] -> [B*C_chunk, K, D_clip]
-        key_value = clip_text_tokens_native[None].expand(
-            batch_size,
-            num_classes,
-            num_templates,
-            text_dim,
-        )
-        key_value = key_value.reshape(
-            batch_size * num_classes,
-            num_templates,
-            text_dim,
-        ).contiguous()
-
-        text_message, _ = self.clip_native_image_to_text_attn(
-            query=query,
-            key=key_value,
-            value=key_value,
-            need_weights=False,
-        )
-
-        hv_pair = self.clip_native_image_to_text_norm(query + text_message)
-
-        return hv_pair.reshape(
-            batch_size,
-            num_classes,
-            num_clip_tokens,
-            image_dim,
-        ).contiguous()
-
-    def _build_extra_tokens_from_clip_hv(
-        self,
-        hv_native: torch.Tensor,
-        sam3_text_tokens: torch.Tensor,
-        sam3_text_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if (
-            self.clip_hv_proj is None
-            or self.sam3_to_clip_hv_attn is None
-            or self.sam3_to_clip_hv_norm is None
-            or self.extra_type_embed is None
-        ):
-            raise RuntimeError("OpenCLIP extra token modules are not initialized.")
-
-        batch_size, num_classes, num_clip_tokens, _ = hv_native.shape
-        pair_count = batch_size * num_classes
-        if sam3_text_tokens.shape[0] != pair_count:
-            raise ValueError(
-                f"Pair count mismatch: hv_native has {pair_count}, "
-                f"sam3_text_tokens has {sam3_text_tokens.shape[0]}."
-            )
-
-        hv_native = hv_native.to(device=sam3_text_tokens.device, dtype=sam3_text_tokens.dtype)
-        hv_pair = self.clip_hv_proj(hv_native).reshape(pair_count, num_clip_tokens, self.hidden_dim).contiguous()
-
-        extra_delta, _ = self.sam3_to_clip_hv_attn(
-            query=sam3_text_tokens,
-            key=hv_pair,
-            value=hv_pair,
-            need_weights=False,
-        )
-        extra_tokens = self.sam3_to_clip_hv_norm(sam3_text_tokens + extra_delta)
-        return extra_tokens + self.extra_type_embed.to(device=extra_tokens.device, dtype=extra_tokens.dtype)
 
     def _build_extra_token_aux_logits(
         self,
@@ -802,9 +553,9 @@ class Sam3Image(torch.nn.Module):
         return (x * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
 
     def _build_class_query_seed(
-            self,
-            extra_summary: torch.Tensor,
-            sam3_summary: torch.Tensor,
+        self,
+        extra_summary: torch.Tensor,
+        sam3_summary: torch.Tensor,
     ) -> torch.Tensor:
         query_seed = torch.cat(
             [sam3_summary, extra_summary, sam3_summary * extra_summary],
@@ -839,9 +590,9 @@ class Sam3Image(torch.nn.Module):
         return encoder_tokens, padding_mask
 
     def _run_class_query_encoder_cross_attn(
-            self,
-            class_query_seed: torch.Tensor,
-            encoder_out: Dict[str, torch.Tensor],
+        self,
+        class_query_seed: torch.Tensor,
+        encoder_out: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         num_pairs = int(class_query_seed.shape[0])
 
@@ -868,65 +619,11 @@ class Sam3Image(torch.nn.Module):
         class_query = self.class_query_encoder_cross_attn_norm(query + attn_out)
         return class_query.squeeze(1)
 
-    def _build_clip_dense_logits(
-            self,
-            clip_image_feat_map_native: torch.Tensor,
-            clip_text_tokens_native: torch.Tensor,
-            target_hw: tuple[int, int],
-    ) -> torch.Tensor:
-        if clip_image_feat_map_native.dim() != 4:
-            raise ValueError(
-                "clip_image_feat_map_native must be [B, D_clip, Hc, Wc], "
-                f"got {tuple(clip_image_feat_map_native.shape)}."
-            )
-
-        if clip_text_tokens_native.dim() != 3:
-            raise ValueError(
-                "clip_text_tokens_native must be [C, K, D_clip], "
-                f"got {tuple(clip_text_tokens_native.shape)}."
-            )
-
-        batch_size, image_dim, _, _ = clip_image_feat_map_native.shape
-        num_classes, _, text_dim = clip_text_tokens_native.shape
-
-        if image_dim != text_dim:
-            raise ValueError(
-                f"CLIP image/text dim mismatch: image_dim={image_dim}, text_dim={text_dim}."
-            )
-
-        clip_text_tokens_native = clip_text_tokens_native.to(
-            device=clip_image_feat_map_native.device,
-            dtype=clip_image_feat_map_native.dtype,
-        )
-
-        image_feat = F.normalize(clip_image_feat_map_native, dim=1, eps=1e-6)
-        text_feat = F.normalize(clip_text_tokens_native, dim=-1, eps=1e-6)
-
-        class_text_feat = text_feat.mean(dim=1)
-        class_text_feat = F.normalize(class_text_feat, dim=-1, eps=1e-6)
-
-        clip_dense_logits = torch.einsum(
-            "bdhw,cd->bchw",
-            image_feat,
-            class_text_feat,
-        )
-
-        if tuple(clip_dense_logits.shape[-2:]) != tuple(target_hw):
-            clip_dense_logits = F.interpolate(
-                clip_dense_logits,
-                size=target_hw,
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        if clip_dense_logits.shape[0] != batch_size:
-            raise ValueError("Internal error: CLIP dense logits batch size changed.")
-        if clip_dense_logits.shape[1] != num_classes:
-            raise ValueError("Internal error: CLIP dense logits class count changed.")
-
-        return clip_dense_logits.contiguous()
-
-    def iter_chunk_raw_outputs(self, input: BatchedDatapoint) -> Iterator[Dict[str, Any]]:
+    def iter_chunk_raw_outputs(
+        self,
+        input: BatchedDatapoint,
+        shared_clip_feature: Optional[torch.Tensor] = None,
+    ) -> Iterator[Dict[str, Any]]:
         device = self.device
 
         if len(input.find_inputs) != 1:
@@ -947,9 +644,8 @@ class Sam3Image(torch.nn.Module):
             image_backbone_out = self.backbone.forward_image(input.img_batch)
         image_backbone_out = self._detach_tree(image_backbone_out)
 
-        clip_image_cache = self._build_clip_image_cache(input=input, device=device)
-        if clip_image_cache is None:
-            raise ValueError("clip_image_cache is None. Current semantic pipeline expects OpenCLIP image features.")
+        if shared_clip_feature is None:
+            shared_clip_feature = self.build_shared_clip_feature(input)
 
         for start in range(0, num_classes, chunk_size):
             end = min(start + chunk_size, num_classes)
@@ -977,21 +673,23 @@ class Sam3Image(torch.nn.Module):
                 batch_size=batch_size,
             )
 
-            if "clip_text_tokens_native" not in chunk_text_cache:
-                raise ValueError("clip_text_tokens_native is missing. Check openclip_cfg.extra_token_templates.")
-
-            hv_native = self._build_clip_hv_native(
-                clip_image_feat_map_native=clip_image_cache["clip_image_feat_map_native"],
-                clip_text_tokens_native=chunk_text_cache["clip_text_tokens_native"],
-            )
-            extra_tokens = self._build_extra_tokens_from_clip_hv(
-                hv_native=hv_native,
+            extra_tokens = self._build_extra_tokens_from_shared_clip_feature(
+                shared_clip_feature=shared_clip_feature,
                 sam3_text_tokens=sam3_pair_feats,
                 sam3_text_mask=sam3_pair_mask,
             )
 
-            extra_summary = self._masked_mean_pool(extra_tokens, sam3_pair_mask)
-            sam3_summary = self._masked_mean_pool(sam3_pair_feats, sam3_pair_mask)
+            sam3_pair_feats_for_query = sam3_pair_feats.detach()
+            extra_tokens_for_query = extra_tokens.detach()
+
+            sam3_summary = self._masked_mean_pool(
+                sam3_pair_feats_for_query,
+                sam3_pair_mask,
+            )
+            extra_summary = self._masked_mean_pool(
+                extra_tokens_for_query,
+                sam3_pair_mask,
+            )
 
             chunk_backbone_out["clip_language_features_pair"] = extra_tokens.transpose(0, 1).contiguous()
             chunk_backbone_out["clip_language_mask_pair"] = sam3_pair_mask
@@ -1026,11 +724,6 @@ class Sam3Image(torch.nn.Module):
             )
 
             chunk_outputs[OUTPUT_KEYS.semantic_logits] = semantic_logits
-            chunk_outputs[OUTPUT_KEYS.clip_dense_logits] = self._build_clip_dense_logits(
-                clip_image_feat_map_native=clip_image_cache["clip_image_feat_map_native"],
-                clip_text_tokens_native=chunk_text_cache["clip_text_tokens_native"],
-                target_hw=tuple(semantic_logits.shape[-2:]),
-            )
 
             yield {
                 "chunk_start": start,
@@ -1094,10 +787,10 @@ class Sam3Image(torch.nn.Module):
         return x.reshape(batch_size, num_chunk_classes, *x.shape[1:])
 
     def _extract_and_reshape_chunk_outputs(
-            self,
-            raw_outputs: Dict[str, torch.Tensor],
-            batch_size: int,
-            num_chunk_classes: int,
+        self,
+        raw_outputs: Dict[str, torch.Tensor],
+        batch_size: int,
+        num_chunk_classes: int,
     ) -> Dict[str, torch.Tensor]:
         out = {}
 
@@ -1154,118 +847,78 @@ class Sam3Image(torch.nn.Module):
         return x
 
     def run_final_mixer(
-            self,
-            semantic_logits: torch.Tensor,
-            clip_dense_logits: torch.Tensor,
-            class_query: torch.Tensor,
+        self,
+        semantic_logits: torch.Tensor,
+        class_query: torch.Tensor,
+        shared_clip_feature: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         semantic_logits = self._ensure_4d_logits(
             semantic_logits,
             OUTPUT_KEYS.semantic_logits,
         )
-        clip_dense_logits = self._ensure_4d_logits(
-            clip_dense_logits,
-            OUTPUT_KEYS.clip_dense_logits,
-        )
-
-        if semantic_logits.shape != clip_dense_logits.shape:
-            raise ValueError(
-                "semantic_logits and clip_dense_logits must have the same shape, "
-                f"got {tuple(semantic_logits.shape)} and {tuple(clip_dense_logits.shape)}."
-            )
 
         if class_query.dim() != 3:
             raise ValueError(
                 f"class_query must be [B, C, D], got {tuple(class_query.shape)}."
             )
+        if shared_clip_feature.dim() != 3:
+            raise ValueError(
+                "shared_clip_feature must be [B, N_clip, D], "
+                f"got {tuple(shared_clip_feature.shape)}."
+            )
 
-        batch_size, num_classes, height, width = semantic_logits.shape
+        batch_size, num_classes, _, _ = semantic_logits.shape
 
-        if class_query.shape[:2] != (batch_size, num_classes):
+        if tuple(class_query.shape[:2]) != (batch_size, num_classes):
             raise ValueError(
                 "class_query shape mismatch: "
                 f"class_query.shape[:2]={tuple(class_query.shape[:2])}, "
                 f"expected={(batch_size, num_classes)}."
             )
+        if int(class_query.shape[-1]) != self.hidden_dim:
+            raise ValueError(
+                f"class_query dim mismatch: expected {self.hidden_dim}, "
+                f"got {class_query.shape[-1]}."
+            )
+        if int(shared_clip_feature.shape[0]) != batch_size:
+            raise ValueError(
+                "shared_clip_feature batch size mismatch: "
+                f"{shared_clip_feature.shape[0]} vs {batch_size}."
+            )
+        if int(shared_clip_feature.shape[-1]) != self.hidden_dim:
+            raise ValueError(
+                f"shared_clip_feature dim mismatch: expected {self.hidden_dim}, "
+                f"got {shared_clip_feature.shape[-1]}."
+            )
 
-        class_query = self.class_query_proj(class_query)
-
-        query_delta, _ = self.class_query_self_attn(
-            query=class_query,
-            key=class_query,
-            value=class_query,
-            need_weights=False,
+        final_logits = self.final_mixer(
+            semantic_logits=semantic_logits.detach(),
+            class_query=class_query,
+            shared_clip_feature=shared_clip_feature,
         )
-        class_query_context = self.class_query_self_attn_norm(class_query + query_delta)
-
-        fused_memory = self.score_fusion_block(
-            semantic_logits=semantic_logits,
-            clip_dense_logits=clip_dense_logits,
-        )
-
-        memory_tokens = fused_memory.flatten(3).permute(0, 1, 3, 2).contiguous()
-        memory_tokens = memory_tokens.reshape(
-            batch_size * num_classes,
-            height * width,
-            self.final_mixer_hidden_dim,
-        )
-
-        query_tokens = class_query_context.reshape(
-            batch_size * num_classes,
-            self.final_mixer_hidden_dim,
-        ).unsqueeze(1)
-
-        attended_query, _ = self.suppression_query_cross_attn(
-            query=query_tokens,
-            key=memory_tokens,
-            value=memory_tokens,
-            need_weights=False,
-        )
-
-        attended_query = self.suppression_query_cross_attn_norm(
-            query_tokens + attended_query
-        )
-        attended_query = attended_query.squeeze(1).reshape(
-            batch_size,
-            num_classes,
-            self.final_mixer_hidden_dim,
-        )
-
-        suppression_logits = torch.einsum(
-            "bcd,bcdhw->bchw",
-            attended_query,
-            fused_memory,
-        )
-        suppression_logits = suppression_logits * self.suppression_logit_scale
-
-        suppression_gate = torch.sigmoid(
-            suppression_logits + self.suppression_gate_bias
-        )
-
-        pos_logits = semantic_logits.clamp_min(0.0)
-        neg_logits = semantic_logits.clamp_max(0.0)
-
-        pos_scale = suppression_gate
-        neg_scale = 1.0 + (1.0 - suppression_gate)
-
-        final_logits = pos_logits * pos_scale + neg_logits * neg_scale
 
         return {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
-            OUTPUT_KEYS.clip_dense_logits: clip_dense_logits,
-            OUTPUT_KEYS.class_query: class_query_context,
-            OUTPUT_KEYS.suppression_logits: suppression_logits,
-            OUTPUT_KEYS.suppression_gate: suppression_gate,
+            OUTPUT_KEYS.class_query: class_query,
             OUTPUT_KEYS.final_logits: final_logits,
         }
 
     def run_final_mixer_from_chunks(
-            self,
-            mixer_cache: List[Dict[str, torch.Tensor]],
-            batch: Optional[BatchedDatapoint] = None,
+        self,
+        mixer_cache: List[Dict[str, torch.Tensor]],
+        batch: Optional[BatchedDatapoint] = None,
+        shared_clip_feature: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if len(mixer_cache) == 0:
             raise ValueError("mixer_cache is empty.")
+
+        if shared_clip_feature is None:
+            if batch is None:
+                raise ValueError(
+                    "shared_clip_feature is None, so batch must be provided "
+                    "to build shared_clip_feature."
+                )
+            shared_clip_feature = self.build_shared_clip_feature(batch)
 
         mixer_cache = sorted(
             mixer_cache,
@@ -1274,10 +927,6 @@ class Sam3Image(torch.nn.Module):
 
         semantic_logits = torch.cat(
             [item[OUTPUT_KEYS.semantic_logits] for item in mixer_cache],
-            dim=1,
-        )
-        clip_dense_logits = torch.cat(
-            [item[OUTPUT_KEYS.clip_dense_logits] for item in mixer_cache],
             dim=1,
         )
         class_query = torch.cat(
@@ -1298,8 +947,8 @@ class Sam3Image(torch.nn.Module):
 
         return self.run_final_mixer(
             semantic_logits=semantic_logits,
-            clip_dense_logits=clip_dense_logits,
             class_query=class_query,
+            shared_clip_feature=shared_clip_feature,
         )
 
     def _get_img_feats(self, backbone_out, img_ids):
@@ -1462,5 +1111,12 @@ class Sam3Image(torch.nn.Module):
         return out
 
     def forward(self, input: BatchedDatapoint) -> Dict[str, torch.Tensor]:
-        chunk_outputs = [chunk["raw_outputs"] for chunk in self.iter_chunk_raw_outputs(input)]
+        shared_clip_feature = self.build_shared_clip_feature(input)
+        chunk_outputs = [
+            chunk["raw_outputs"]
+            for chunk in self.iter_chunk_raw_outputs(
+                input,
+                shared_clip_feature=shared_clip_feature,
+            )
+        ]
         return self._merge_chunk_outputs(chunk_outputs)

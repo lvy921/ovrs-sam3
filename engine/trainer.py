@@ -204,7 +204,6 @@ class Trainer:
 
         required_keys = (
             OUTPUT_KEYS.semantic_logits,
-            OUTPUT_KEYS.clip_dense_logits,
             OUTPUT_KEYS.class_query,
         )
         for key in required_keys:
@@ -217,30 +216,49 @@ class Trainer:
             OUTPUT_KEYS.semantic_logits: train_outputs[
                 OUTPUT_KEYS.semantic_logits
             ].detach(),
-            OUTPUT_KEYS.clip_dense_logits: train_outputs[
-                OUTPUT_KEYS.clip_dense_logits
-            ].detach(),
             OUTPUT_KEYS.class_query: train_outputs[
                 OUTPUT_KEYS.class_query
             ],
             "chunk_class_ids": list(chunk["chunk_class_ids"]),
         }
 
+    @staticmethod
+    def _accumulate_proxy_grad(
+        accumulated_grad: Optional[torch.Tensor],
+        proxy_tensor: Optional[torch.Tensor],
+    ) -> None:
+        if accumulated_grad is None or proxy_tensor is None:
+            return
+
+        proxy_grad = getattr(proxy_tensor, "grad", None)
+        if proxy_grad is None:
+            return
+
+        accumulated_grad.add_(proxy_grad.detach())
+        proxy_tensor.grad = None
+
     def _compute_chunk_loss_sums(
             self,
             batch,
             do_backward: bool,
     ) -> tuple[Dict[str, float], int, bool]:
+        if not hasattr(self.model, "build_shared_clip_feature"):
+            raise AttributeError(
+                "Model does not provide build_shared_clip_feature(batch). "
+                "The shared CLIP feature training pipeline requires this interface."
+            )
+
         if not hasattr(self.model, "iter_chunk_outputs"):
             raise AttributeError(
-                "Model does not provide iter_chunk_outputs(batch). "
+                "Model does not provide iter_chunk_outputs(batch, shared_clip_feature). "
                 "The chunked training pipeline requires this interface."
             )
 
         if not hasattr(self.model, "run_final_mixer_from_chunks"):
             raise AttributeError(
-                "Model does not provide run_final_mixer_from_chunks(mixer_cache, batch). "
-                "The suppression-gate training pipeline requires this interface."
+                "Model does not provide run_final_mixer_from_chunks("
+                "mixer_cache, batch, shared_clip_feature). "
+                "The final mixer training pipeline requires this interface."
             )
 
         label_map = batch.find_targets[0].semantic_label_map
@@ -251,7 +269,21 @@ class Trainer:
         did_backward = False
         mixer_cache = []
 
-        chunk_iter = self.model.iter_chunk_outputs(batch)
+        with autocast(device_type=self.device.type, enabled=use_amp):
+            shared_clip_feature = self.model.build_shared_clip_feature(batch)
+
+        accumulated_clip_feature_grad = None
+        if do_backward:
+            accumulated_clip_feature_grad = torch.zeros_like(shared_clip_feature)
+
+        clip_proxy = shared_clip_feature.detach()
+        if do_backward:
+            clip_proxy.requires_grad_(True)
+
+        chunk_iter = self.model.iter_chunk_outputs(
+            batch,
+            shared_clip_feature=clip_proxy,
+        )
 
         while True:
             try:
@@ -289,6 +321,10 @@ class Trainer:
 
             if do_backward and chunk_num_valid > 0:
                 self.scaler.scale(chunk_total_loss).backward()
+                self._accumulate_proxy_grad(
+                    accumulated_grad=accumulated_clip_feature_grad,
+                    proxy_tensor=clip_proxy,
+                )
                 did_backward = True
 
             del chunk
@@ -301,10 +337,15 @@ class Trainer:
         if len(mixer_cache) == 0:
             return loss_sums, total_valid_pixels, did_backward
 
+        final_clip_proxy = shared_clip_feature.detach()
+        if do_backward:
+            final_clip_proxy.requires_grad_(True)
+
         with autocast(device_type=self.device.type, enabled=use_amp):
             final_raw_outputs = self.model.run_final_mixer_from_chunks(
                 mixer_cache=mixer_cache,
                 batch=batch,
+                shared_clip_feature=final_clip_proxy,
             )
 
             final_outputs = self.model.adapter(
@@ -339,9 +380,23 @@ class Trainer:
 
         if do_backward and final_num_valid > 0:
             self.scaler.scale(final_total_loss).backward()
+            self._accumulate_proxy_grad(
+                accumulated_grad=accumulated_clip_feature_grad,
+                proxy_tensor=final_clip_proxy,
+            )
             did_backward = True
 
+        if (
+                do_backward
+                and did_backward
+                and accumulated_clip_feature_grad is not None
+        ):
+            shared_clip_feature.backward(accumulated_clip_feature_grad)
+
         del mixer_cache
+        del clip_proxy
+        del final_clip_proxy
+        del shared_clip_feature
         del final_raw_outputs
         del final_outputs
         del final_loss_dict

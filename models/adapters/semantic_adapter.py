@@ -126,10 +126,6 @@ class SemanticSegAdapter(nn.Module):
             self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.semantic_logits),
             OUTPUT_KEYS.semantic_logits,
         )
-        clip_dense_logits = self._ensure_4d_map(
-            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.clip_dense_logits),
-            OUTPUT_KEYS.clip_dense_logits,
-        )
         class_query = self._ensure_3d_query(
             self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.class_query),
             OUTPUT_KEYS.class_query,
@@ -144,12 +140,6 @@ class SemanticSegAdapter(nn.Module):
             actual_num_classes=actual_num_classes,
             expected_num_classes=expected_num_classes,
         )
-        self._validate_same_shape(
-            semantic_logits,
-            clip_dense_logits,
-            OUTPUT_KEYS.semantic_logits,
-            OUTPUT_KEYS.clip_dense_logits,
-        )
         self._validate_query_shape(
             class_query=class_query,
             semantic_logits=semantic_logits,
@@ -157,7 +147,6 @@ class SemanticSegAdapter(nn.Module):
 
         outputs = {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
-            OUTPUT_KEYS.clip_dense_logits: clip_dense_logits,
             OUTPUT_KEYS.class_query: class_query,
         }
 
@@ -187,14 +176,6 @@ class SemanticSegAdapter(nn.Module):
             self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.final_logits),
             OUTPUT_KEYS.final_logits,
         )
-        suppression_logits = self._ensure_4d_map(
-            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.suppression_logits),
-            OUTPUT_KEYS.suppression_logits,
-        )
-        suppression_gate = self._ensure_4d_map(
-            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.suppression_gate),
-            OUTPUT_KEYS.suppression_gate,
-        )
 
         actual_num_classes = int(semantic_logits.shape[1])
         expected_num_classes = self._infer_expected_num_classes(
@@ -206,17 +187,12 @@ class SemanticSegAdapter(nn.Module):
             expected_num_classes=expected_num_classes,
         )
 
-        for key, value in (
-            (OUTPUT_KEYS.final_logits, final_logits),
-            (OUTPUT_KEYS.suppression_logits, suppression_logits),
-            (OUTPUT_KEYS.suppression_gate, suppression_gate),
-        ):
-            self._validate_same_shape(
-                semantic_logits,
-                value,
-                OUTPUT_KEYS.semantic_logits,
-                key,
-            )
+        self._validate_same_shape(
+            semantic_logits,
+            final_logits,
+            OUTPUT_KEYS.semantic_logits,
+            OUTPUT_KEYS.final_logits,
+        )
 
         semantic_score_map = semantic_logits.sigmoid()
         final_score_map = final_logits.sigmoid()
@@ -228,26 +204,7 @@ class SemanticSegAdapter(nn.Module):
             OUTPUT_KEYS.final_logits: final_logits,
             OUTPUT_KEYS.final_score_map: final_score_map,
             OUTPUT_KEYS.final_pred: final_pred,
-            OUTPUT_KEYS.suppression_logits: suppression_logits,
-            OUTPUT_KEYS.suppression_gate: suppression_gate,
         }
-
-        clip_dense_logits = self._extract_optional_tensor(
-            raw_outputs,
-            OUTPUT_KEYS.clip_dense_logits,
-        )
-        if clip_dense_logits is not None:
-            clip_dense_logits = self._ensure_4d_map(
-                clip_dense_logits,
-                OUTPUT_KEYS.clip_dense_logits,
-            )
-            self._validate_same_shape(
-                semantic_logits,
-                clip_dense_logits,
-                OUTPUT_KEYS.semantic_logits,
-                OUTPUT_KEYS.clip_dense_logits,
-            )
-            outputs[OUTPUT_KEYS.clip_dense_logits] = clip_dense_logits
 
         class_query = self._extract_optional_tensor(
             raw_outputs,
