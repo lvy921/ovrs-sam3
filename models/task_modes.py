@@ -17,13 +17,17 @@ class ModelOutputKeys:
     semantic_logits: str = "semantic_logits"
     semantic_score_map: str = "semantic_score_map"
 
-    class_query: str = "class_query"
+    class_tokens: str = "class_tokens"
+
+    delta_logits: str = "delta_logits"
+    modulated_delta_logits: str = "modulated_delta_logits"
 
     final_logits: str = "final_logits"
     final_score_map: str = "final_score_map"
     final_pred: str = "final_pred"
 
-    extra_token_aux_logits: str = "extra_token_aux_logits"
+    presence_logits: str = "presence_logits"
+    presence_score: str = "presence_score"
 
 
 OUTPUT_KEYS = ModelOutputKeys()

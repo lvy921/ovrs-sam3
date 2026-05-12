@@ -197,14 +197,14 @@ class Trainer:
         }
 
     def _build_final_mixer_cache_item(
-            self,
-            chunk: Dict,
+        self,
+        chunk: Dict,
     ) -> Dict[str, torch.Tensor | list[int]]:
         train_outputs = chunk["train_outputs"]
 
         required_keys = (
             OUTPUT_KEYS.semantic_logits,
-            OUTPUT_KEYS.class_query,
+            OUTPUT_KEYS.class_tokens,
         )
         for key in required_keys:
             if key not in train_outputs:
@@ -216,8 +216,8 @@ class Trainer:
             OUTPUT_KEYS.semantic_logits: train_outputs[
                 OUTPUT_KEYS.semantic_logits
             ].detach(),
-            OUTPUT_KEYS.class_query: train_outputs[
-                OUTPUT_KEYS.class_query
+            OUTPUT_KEYS.class_tokens: train_outputs[
+                OUTPUT_KEYS.class_tokens
             ],
             "chunk_class_ids": list(chunk["chunk_class_ids"]),
         }

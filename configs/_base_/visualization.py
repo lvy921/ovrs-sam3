@@ -11,10 +11,16 @@ visualization = dict(
 
     save_score_summary=True,
     save_score_heatmaps=True,
-    save_extra_token_aux_heatmaps=True,
+    save_delta_heatmaps=True,
+    save_modulated_delta_heatmaps=True,
     heatmap_colormap="turbo",
 
     save_clip_argmax_prediction=True,
+
+    save_sam3_direct_segmentation=True,
+    sam3_direct_seg_threshold=0.5,
+
+    save_presence_scores=True,
 
     vis_prob=0.05,
     max_samples_per_epoch=100,

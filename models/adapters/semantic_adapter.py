@@ -51,13 +51,13 @@ class SemanticSegAdapter(nn.Module):
         return x
 
     @staticmethod
-    def _ensure_3d_query(
+    def _ensure_4d_class_tokens(
         x: torch.Tensor,
         key: str,
     ) -> torch.Tensor:
-        if x.dim() != 3:
+        if x.dim() != 4:
             raise ValueError(
-                f"Expected {key} as [B, C, D], got {tuple(x.shape)}."
+                f"Expected {key} as [B, C, Q, D], got {tuple(x.shape)}."
             )
         return x
 
@@ -105,14 +105,38 @@ class SemanticSegAdapter(nn.Module):
             )
 
     @staticmethod
-    def _validate_query_shape(
-        class_query: torch.Tensor,
+    def _validate_class_tokens_shape(
+        class_tokens: torch.Tensor,
         semantic_logits: torch.Tensor,
     ) -> None:
-        if class_query.shape[:2] != semantic_logits.shape[:2]:
+        if class_tokens.shape[:2] != semantic_logits.shape[:2]:
             raise ValueError(
-                "Shape mismatch between class_query and semantic_logits: "
-                f"class_query.shape[:2]={tuple(class_query.shape[:2])}, "
+                "Shape mismatch between class_tokens and semantic_logits: "
+                f"class_tokens.shape[:2]={tuple(class_tokens.shape[:2])}, "
+                f"semantic_logits.shape[:2]={tuple(semantic_logits.shape[:2])}."
+            )
+
+    @staticmethod
+    def _ensure_2d_class_tensor(
+            x: torch.Tensor,
+            key: str,
+    ) -> torch.Tensor:
+        if x.dim() != 2:
+            raise ValueError(
+                f"Expected {key} as [B, C], got {tuple(x.shape)}."
+            )
+        return x
+
+    @staticmethod
+    def _validate_class_vector_shape(
+            class_vector: torch.Tensor,
+            semantic_logits: torch.Tensor,
+            key: str,
+    ) -> None:
+        if class_vector.shape != semantic_logits.shape[:2]:
+            raise ValueError(
+                f"Shape mismatch between {key} and semantic_logits: "
+                f"{key}.shape={tuple(class_vector.shape)}, "
                 f"semantic_logits.shape[:2]={tuple(semantic_logits.shape[:2])}."
             )
 
@@ -126,9 +150,9 @@ class SemanticSegAdapter(nn.Module):
             self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.semantic_logits),
             OUTPUT_KEYS.semantic_logits,
         )
-        class_query = self._ensure_3d_query(
-            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.class_query),
-            OUTPUT_KEYS.class_query,
+        class_tokens = self._ensure_4d_class_tokens(
+            self._extract_required_tensor(raw_outputs, OUTPUT_KEYS.class_tokens),
+            OUTPUT_KEYS.class_tokens,
         )
 
         actual_num_classes = int(semantic_logits.shape[1])
@@ -140,27 +164,15 @@ class SemanticSegAdapter(nn.Module):
             actual_num_classes=actual_num_classes,
             expected_num_classes=expected_num_classes,
         )
-        self._validate_query_shape(
-            class_query=class_query,
+        self._validate_class_tokens_shape(
+            class_tokens=class_tokens,
             semantic_logits=semantic_logits,
         )
 
-        outputs = {
+        return {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
-            OUTPUT_KEYS.class_query: class_query,
+            OUTPUT_KEYS.class_tokens: class_tokens,
         }
-
-        extra_token_aux_logits = self._extract_optional_tensor(
-            raw_outputs,
-            OUTPUT_KEYS.extra_token_aux_logits,
-        )
-        if extra_token_aux_logits is not None:
-            outputs[OUTPUT_KEYS.extra_token_aux_logits] = self._ensure_4d_map(
-                extra_token_aux_logits,
-                OUTPUT_KEYS.extra_token_aux_logits,
-            )
-
-        return outputs
 
     def _build_final_outputs(
         self,
@@ -206,30 +218,71 @@ class SemanticSegAdapter(nn.Module):
             OUTPUT_KEYS.final_pred: final_pred,
         }
 
-        class_query = self._extract_optional_tensor(
-            raw_outputs,
-            OUTPUT_KEYS.class_query,
-        )
-        if class_query is not None:
-            class_query = self._ensure_3d_query(
-                class_query,
-                OUTPUT_KEYS.class_query,
+        for key in (
+            OUTPUT_KEYS.delta_logits,
+            OUTPUT_KEYS.modulated_delta_logits,
+        ):
+            value = self._extract_optional_tensor(raw_outputs, key)
+            if value is None:
+                continue
+
+            value = self._ensure_4d_map(value, key)
+            self._validate_same_shape(
+                semantic_logits,
+                value,
+                OUTPUT_KEYS.semantic_logits,
+                key,
             )
-            self._validate_query_shape(
-                class_query=class_query,
+            outputs[key] = value
+
+        class_tokens = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.class_tokens,
+        )
+        if class_tokens is not None:
+            class_tokens = self._ensure_4d_class_tokens(
+                class_tokens,
+                OUTPUT_KEYS.class_tokens,
+            )
+            self._validate_class_tokens_shape(
+                class_tokens=class_tokens,
                 semantic_logits=semantic_logits,
             )
-            outputs[OUTPUT_KEYS.class_query] = class_query
+            outputs[OUTPUT_KEYS.class_tokens] = class_tokens
 
-        extra_token_aux_logits = self._extract_optional_tensor(
+        presence_logits = self._extract_optional_tensor(
             raw_outputs,
-            OUTPUT_KEYS.extra_token_aux_logits,
+            OUTPUT_KEYS.presence_logits,
         )
-        if extra_token_aux_logits is not None:
-            outputs[OUTPUT_KEYS.extra_token_aux_logits] = self._ensure_4d_map(
-                extra_token_aux_logits,
-                OUTPUT_KEYS.extra_token_aux_logits,
+        if presence_logits is not None:
+            presence_logits = self._ensure_2d_class_tensor(
+                presence_logits,
+                OUTPUT_KEYS.presence_logits,
             )
+            self._validate_class_vector_shape(
+                class_vector=presence_logits,
+                semantic_logits=semantic_logits,
+                key=OUTPUT_KEYS.presence_logits,
+            )
+            outputs[OUTPUT_KEYS.presence_logits] = presence_logits
+
+        presence_score = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.presence_score,
+        )
+        if presence_score is not None:
+            presence_score = self._ensure_2d_class_tensor(
+                presence_score,
+                OUTPUT_KEYS.presence_score,
+            )
+            self._validate_class_vector_shape(
+                class_vector=presence_score,
+                semantic_logits=semantic_logits,
+                key=OUTPUT_KEYS.presence_score,
+            )
+            outputs[OUTPUT_KEYS.presence_score] = presence_score
+        elif presence_logits is not None:
+            outputs[OUTPUT_KEYS.presence_score] = presence_logits.sigmoid()
 
         return outputs
 

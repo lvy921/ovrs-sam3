@@ -55,7 +55,7 @@ class SAM3Segmentor(nn.Module):
     ) -> Dict[str, torch.Tensor | list[int]]:
         required_keys = (
             OUTPUT_KEYS.semantic_logits,
-            OUTPUT_KEYS.class_query,
+            OUTPUT_KEYS.class_tokens,
         )
 
         for key in required_keys:
@@ -65,14 +65,14 @@ class SAM3Segmentor(nn.Module):
                 )
 
         semantic_logits = outputs[OUTPUT_KEYS.semantic_logits]
-        class_query = outputs[OUTPUT_KEYS.class_query]
+        class_tokens = outputs[OUTPUT_KEYS.class_tokens]
 
         if detach_score_maps:
             semantic_logits = semantic_logits.detach()
 
         return {
             OUTPUT_KEYS.semantic_logits: semantic_logits,
-            OUTPUT_KEYS.class_query: class_query,
+            OUTPUT_KEYS.class_tokens: class_tokens,
             "chunk_class_ids": list(chunk_class_ids),
         }
 
@@ -120,7 +120,6 @@ class SAM3Segmentor(nn.Module):
         shared_clip_feature = self.build_shared_clip_feature(batch)
 
         mixer_cache = []
-        extra_token_aux_chunks = []
 
         for chunk in self.core.iter_chunk_raw_outputs(
                 batch,
@@ -143,22 +142,11 @@ class SAM3Segmentor(nn.Module):
                 )
             )
 
-            if OUTPUT_KEYS.extra_token_aux_logits in chunk_outputs:
-                extra_token_aux_chunks.append(
-                    chunk_outputs[OUTPUT_KEYS.extra_token_aux_logits]
-                )
-
         final_raw_outputs = self.run_final_mixer_from_chunks(
             mixer_cache=mixer_cache,
             batch=batch,
             shared_clip_feature=shared_clip_feature,
         )
-
-        if len(extra_token_aux_chunks) > 0:
-            final_raw_outputs[OUTPUT_KEYS.extra_token_aux_logits] = torch.cat(
-                extra_token_aux_chunks,
-                dim=1,
-            )
 
         return self.adapter(
             raw_outputs=final_raw_outputs,
