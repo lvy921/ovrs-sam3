@@ -85,6 +85,25 @@ class LoggerHook(Hook):
             return f"{v:.4f}"
         return str(v)
 
+    @staticmethod
+    def _get_class_names_from_trainer(trainer):
+        dataloader = getattr(trainer, "val_dataloader", None)
+        if dataloader is None:
+            return None
+
+        dataset = getattr(dataloader, "dataset", None)
+        while dataset is not None and hasattr(dataset, "dataset"):
+            dataset = dataset.dataset
+
+        if dataset is None:
+            return None
+
+        classes = getattr(dataset, "classes", None)
+        if classes is None:
+            return None
+
+        return [str(x) for x in classes]
+
     def after_train_iter(self, trainer, global_iter: int, batch, outputs: Dict[str, float]):
         state = getattr(trainer, "log_state", None)
         if not state or state.get("mode") != "train":

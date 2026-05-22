@@ -6,46 +6,225 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..models.task_modes import OUTPUT_KEYS
 from ..config_dataclasses import SemanticCriterionConfig
+from ..models.task_modes import OUTPUT_KEYS
+
+
+TensorDict = Dict[str, torch.Tensor]
+
 
 class SemanticCriterion(nn.Module):
     def __init__(self, cfg: Optional[SemanticCriterionConfig] = None):
         super().__init__()
         self.cfg = cfg or SemanticCriterionConfig()
 
-    @staticmethod
-    def _extract_required_logits(
-        outputs: Dict[str, torch.Tensor],
-        key: str,
-    ) -> torch.Tensor:
-        logits = outputs.get(key, None)
-        if logits is None:
-            raise ValueError(f"SemanticCriterion expects outputs['{key}'].")
-        if logits.dim() != 4:
-            raise ValueError(
-                f"Expected {key} as [B, C, H, W], got {tuple(logits.shape)}."
-            )
-        return logits
-
-    @staticmethod
-    def _extract_required_class_logits(
-        outputs: Dict[str, torch.Tensor],
-        key: str,
-    ) -> torch.Tensor:
-        logits = outputs.get(key, None)
-        if logits is None:
-            raise ValueError(f"SemanticCriterion expects outputs['{key}'].")
-        if logits.dim() != 2:
-            raise ValueError(
-                f"Expected {key} as [B, C], got {tuple(logits.shape)}."
-            )
-        return logits
-
-    def _extract_label_map(
+    def forward(
         self,
-        targets: Dict[str, torch.Tensor],
+        outputs: TensorDict,
+        targets: TensorDict,
+        chunk_class_ids: Optional[Sequence[int]] = None,
+        reduction: str = "mean",
+    ) -> TensorDict:
+        if reduction != "mean":
+            raise ValueError(
+                f"SemanticCriterion only supports reduction='mean', got {reduction!r}."
+            )
+
+        if OUTPUT_KEYS.final_logits not in outputs:
+            raise ValueError(
+                "SemanticCriterion only supports final-stage outputs. "
+                "Chunk-stage semantic loss has been removed."
+            )
+
+        return self._forward_final(outputs=outputs, targets=targets)
+
+    def _forward_final(
+        self,
+        outputs: TensorDict,
+        targets: TensorDict,
+    ) -> TensorDict:
+        semantic_logits = self._extract_required_tensor(
+            outputs=outputs,
+            key=OUTPUT_KEYS.semantic_logits,
+            ndim=4,
+            shape_name="[B, C, H, W]",
+        )
+        final_logits = self._extract_required_tensor(
+            outputs=outputs,
+            key=OUTPUT_KEYS.final_logits,
+            ndim=4,
+            shape_name="[B, C, H, W]",
+        )
+        presence_logits = self._extract_required_tensor(
+            outputs=outputs,
+            key=OUTPUT_KEYS.presence_logits,
+            ndim=2,
+            shape_name="[B, C]",
+        )
+
+        if final_logits.shape != semantic_logits.shape:
+            raise ValueError(
+                "final_logits and semantic_logits must have the same shape, "
+                f"got {tuple(final_logits.shape)} and {tuple(semantic_logits.shape)}."
+            )
+
+        if presence_logits.shape != semantic_logits.shape[:2]:
+            raise ValueError(
+                "presence_logits must be [B, C] matching semantic_logits, "
+                f"got {tuple(presence_logits.shape)} and "
+                f"semantic_logits.shape[:2]={tuple(semantic_logits.shape[:2])}."
+            )
+
+        label_map = self._extract_label_map(targets)
+        label_map = self._resize_label_map_to_hw(
+            label_map=label_map,
+            target_hw=tuple(final_logits.shape[-2:]),
+        )
+
+        num_channels = int(final_logits.shape[1])
+        class_ids = list(range(num_channels))
+
+        target, valid_mask = self._build_binary_targets(
+            label_map=label_map,
+            class_ids=class_ids,
+            num_channels=num_channels,
+        )
+        present_pair_mask = self._build_present_pair_mask(
+            target=target,
+            valid_mask=valid_mask,
+        )
+        presence_target, presence_valid_mask = self._build_presence_target(
+            target=target,
+            valid_mask=valid_mask,
+        )
+
+        num_valid_pixels = int((label_map != int(self.cfg.ignore_index)).sum().item())
+        zero = self._zero_loss(final_logits)
+
+        loss_final_ignore_bce = self._final_ignore_bce_loss(
+            final_logits=final_logits,
+            semantic_logits=semantic_logits,
+            valid_mask=valid_mask,
+        )
+        loss_presence_bce, presence_loss_log_items = self._presence_loss_from_outputs(
+            outputs=outputs,
+            presence_logits=presence_logits,
+            presence_target=presence_target,
+            presence_valid_mask=presence_valid_mask,
+        )
+
+        if num_valid_pixels <= 0:
+            total_loss = (
+                float(self.cfg.final_ignore_bce_weight) * loss_final_ignore_bce
+                + float(self.cfg.presence_loss_weight) * loss_presence_bce
+            )
+
+            loss_dict = {
+                "loss_final_bce": zero,
+                "loss_final_dice": zero,
+                "loss_final_ce": zero,
+                "loss_final_ignore_bce": loss_final_ignore_bce,
+                "loss_presence_bce": loss_presence_bce,
+                "loss_mask_layers_aux": zero,
+                "total_loss": total_loss,
+                "num_valid": torch.tensor(
+                    0,
+                    device=final_logits.device,
+                    dtype=torch.long,
+                ),
+            }
+            loss_dict.update(presence_loss_log_items)
+            return loss_dict
+
+        bce_class_weights = self._build_dynamic_pair_weights(
+            target=target,
+            valid_mask=valid_mask,
+            present_pair_mask=present_pair_mask,
+            clamp_min=float(self.cfg.bce_class_balance_clamp_min),
+            clamp_max=float(self.cfg.bce_class_balance_clamp_max),
+        )
+        ce_class_weights = self._build_dynamic_pair_weights(
+            target=target,
+            valid_mask=valid_mask,
+            present_pair_mask=present_pair_mask,
+            clamp_min=float(self.cfg.ce_class_balance_clamp_min),
+            clamp_max=float(self.cfg.ce_class_balance_clamp_max),
+        )
+        ce_label_map = self._build_ce_label_map(
+            label_map=label_map,
+            class_ids=class_ids,
+        )
+
+        loss_final_bce, loss_final_dice, loss_final_ce, num_ce_valid = (
+            self._basic_mask_losses(
+                logits=final_logits,
+                target=target,
+                valid_mask=valid_mask,
+                present_pair_mask=present_pair_mask,
+                bce_class_weights=bce_class_weights,
+                ce_label_map=ce_label_map,
+                ce_class_weights=ce_class_weights,
+            )
+        )
+
+        loss_aux_mask_layers, aux_loss_dict = self._aux_mask_layer_losses(
+            outputs=outputs,
+            final_logits=final_logits,
+            target=target,
+            valid_mask=valid_mask,
+            present_pair_mask=present_pair_mask,
+            bce_class_weights=bce_class_weights,
+            ce_label_map=ce_label_map,
+            ce_class_weights=ce_class_weights,
+        )
+
+        total_loss = (
+            float(self.cfg.final_bce_weight) * loss_final_bce
+            + float(self.cfg.final_dice_weight) * loss_final_dice
+            + float(self.cfg.final_ce_weight) * loss_final_ce
+            + float(self.cfg.final_ignore_bce_weight) * loss_final_ignore_bce
+            + float(self.cfg.presence_loss_weight) * loss_presence_bce
+            + loss_aux_mask_layers
+        )
+
+        loss_dict = {
+            "loss_final_bce": loss_final_bce,
+            "loss_final_dice": loss_final_dice,
+            "loss_final_ce": loss_final_ce,
+            "loss_final_ignore_bce": loss_final_ignore_bce,
+            "loss_presence_bce": loss_presence_bce,
+            "total_loss": total_loss,
+            "num_valid": torch.tensor(
+                max(num_valid_pixels, num_ce_valid),
+                device=final_logits.device,
+                dtype=torch.long,
+            ),
+        }
+        loss_dict.update(presence_loss_log_items)
+        loss_dict.update(aux_loss_dict)
+        return loss_dict
+
+    @staticmethod
+    def _zero_loss(reference: torch.Tensor) -> torch.Tensor:
+        return reference.sum() * 0.0
+
+    @staticmethod
+    def _extract_required_tensor(
+        outputs: TensorDict,
+        key: str,
+        ndim: int,
+        shape_name: str,
     ) -> torch.Tensor:
+        tensor = outputs.get(key, None)
+        if tensor is None:
+            raise ValueError(f"SemanticCriterion expects outputs['{key}'].")
+        if tensor.dim() != int(ndim):
+            raise ValueError(
+                f"Expected {key} as {shape_name}, got {tuple(tensor.shape)}."
+            )
+        return tensor
+
+    def _extract_label_map(self, targets: TensorDict) -> torch.Tensor:
         if "label_map" not in targets:
             raise ValueError("SemanticCriterion expects targets['label_map'].")
 
@@ -53,20 +232,20 @@ class SemanticCriterion(nn.Module):
         if label_map.dim() == 4:
             if label_map.shape[1] != 1:
                 raise ValueError(
-                    f"Expected label_map as [B, 1, H, W] or [B, H, W], "
+                    "Expected label_map as [B, 1, H, W] or [B, H, W], "
                     f"got {tuple(label_map.shape)}."
                 )
             label_map = label_map[:, 0]
         elif label_map.dim() != 3:
             raise ValueError(
-                f"Expected label_map as [B, H, W] or [B, 1, H, W], "
+                "Expected label_map as [B, H, W] or [B, 1, H, W], "
                 f"got {tuple(label_map.shape)}."
             )
 
         return label_map.long()
 
     @staticmethod
-    def _resize_label_map_to_logits(
+    def _resize_label_map_to_hw(
         label_map: torch.Tensor,
         target_hw: tuple[int, int],
     ) -> torch.Tensor:
@@ -79,23 +258,7 @@ class SemanticCriterion(nn.Module):
             mode="nearest",
         )[:, 0].long()
 
-    def _build_class_ids(
-        self,
-        num_channels: int,
-        chunk_class_ids: Optional[Sequence[int]],
-    ) -> list[int]:
-        if chunk_class_ids is None:
-            return list(range(num_channels))
-
-        if len(chunk_class_ids) != num_channels:
-            raise ValueError(
-                f"chunk_class_ids length mismatch: expected {num_channels}, "
-                f"got {len(chunk_class_ids)}."
-            )
-
-        return [int(x) for x in chunk_class_ids]
-
-    def _build_targets(
+    def _build_binary_targets(
         self,
         label_map: torch.Tensor,
         class_ids: Sequence[int],
@@ -127,8 +290,8 @@ class SemanticCriterion(nn.Module):
         )
         return target, valid_mask_4d
 
+    @staticmethod
     def _build_present_pair_mask(
-        self,
         target: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
@@ -157,13 +320,84 @@ class SemanticCriterion(nn.Module):
         valid_per_image = valid_mask[:, 0].flatten(1).any(dim=1)
         presence_valid_mask = valid_per_image[:, None].expand_as(presence_target)
 
-        return (
-            presence_target.to(dtype=target.dtype),
-            presence_valid_mask,
+        return presence_target.to(dtype=target.dtype), presence_valid_mask
+
+    def _presence_loss_from_outputs(
+        self,
+        outputs: TensorDict,
+        presence_logits: torch.Tensor,
+        presence_target: torch.Tensor,
+        presence_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, TensorDict]:
+        presence_logits_layers = outputs.get(OUTPUT_KEYS.presence_logits_layers, None)
+
+        if presence_logits_layers is None:
+            loss = self._presence_bce_loss(
+                presence_logits=presence_logits,
+                presence_target=presence_target,
+                presence_valid_mask=presence_valid_mask,
+            )
+            return loss, {"loss_presence_final_bce": loss.detach()}
+
+        if presence_logits_layers.dim() != 3:
+            raise ValueError(
+                "presence_logits_layers must be [L, B, C], got "
+                f"{tuple(presence_logits_layers.shape)}."
+            )
+
+        if tuple(presence_logits_layers.shape[1:]) != tuple(presence_target.shape):
+            raise ValueError(
+                "presence_logits_layers shape mismatch: expected [L, B, C] "
+                f"with B,C={tuple(presence_target.shape)}, got "
+                f"{tuple(presence_logits_layers.shape)}."
+            )
+
+        num_layers = int(presence_logits_layers.shape[0])
+        weights_tensor = self._build_presence_layer_weights(
+            presence_logits_layers=presence_logits_layers,
+            num_layers=num_layers,
         )
 
-    def _presence_bce_loss(
+        total_loss = self._zero_loss(presence_logits_layers)
+        log_items: TensorDict = {}
+
+        for layer_idx in range(num_layers):
+            layer_loss = self._presence_bce_loss(
+                presence_logits=presence_logits_layers[layer_idx],
+                presence_target=presence_target,
+                presence_valid_mask=presence_valid_mask,
+            )
+            layer_weighted_loss = weights_tensor[layer_idx] * layer_loss
+            total_loss = total_loss + layer_weighted_loss
+
+            log_items[f"loss_presence_layer_{layer_idx}_bce"] = layer_loss.detach()
+            log_items[f"loss_presence_layer_{layer_idx}_weighted"] = (
+                layer_weighted_loss.detach()
+            )
+
+        return total_loss, log_items
+
+    def _build_presence_layer_weights(
         self,
+        presence_logits_layers: torch.Tensor,
+        num_layers: int,
+    ) -> torch.Tensor:
+        weights = self.cfg.presence_layer_loss_weights
+        if weights is None:
+            return presence_logits_layers.new_full(
+                (num_layers,),
+                1.0 / max(num_layers, 1),
+            )
+
+        if len(weights) != num_layers:
+            raise ValueError(
+                "presence_layer_loss_weights length must match presence "
+                f"layers: got {len(weights)} weights for {num_layers} layers."
+            )
+        return presence_logits_layers.new_tensor(list(weights))
+
+    @staticmethod
+    def _presence_bce_loss(
         presence_logits: torch.Tensor,
         presence_target: torch.Tensor,
         presence_valid_mask: torch.Tensor,
@@ -186,86 +420,8 @@ class SemanticCriterion(nn.Module):
             presence_target,
             reduction="none",
         )
-        per_elem = per_elem * presence_valid_mask.to(dtype=per_elem.dtype)
-
-        denom = presence_valid_mask.to(dtype=per_elem.dtype).sum().clamp_min(1.0)
-        return per_elem.sum() / denom
-
-    def _presence_loss_from_outputs(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        presence_logits: torch.Tensor,
-        presence_target: torch.Tensor,
-        presence_valid_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        layers_key = getattr(
-            OUTPUT_KEYS,
-            "presence_logits_layers",
-            "presence_logits_layers",
-        )
-        presence_logits_layers = outputs.get(layers_key, None)
-
-        if presence_logits_layers is None:
-            loss = self._presence_bce_loss(
-                presence_logits=presence_logits,
-                presence_target=presence_target,
-                presence_valid_mask=presence_valid_mask,
-            )
-            return loss, {
-                "loss_presence_final_bce": loss.detach(),
-            }
-
-        if presence_logits_layers.dim() != 3:
-            raise ValueError(
-                "presence_logits_layers must be [L, B, C], got "
-                f"{tuple(presence_logits_layers.shape)}."
-            )
-
-        if tuple(presence_logits_layers.shape[1:]) != tuple(presence_target.shape):
-            raise ValueError(
-                "presence_logits_layers shape mismatch: expected [L, B, C] "
-                f"with B,C={tuple(presence_target.shape)}, got "
-                f"{tuple(presence_logits_layers.shape)}."
-            )
-
-        num_layers = int(presence_logits_layers.shape[0])
-        weights = self.cfg.presence_layer_loss_weights
-
-        if weights is None:
-            weights_tensor = presence_logits_layers.new_full(
-                (num_layers,),
-                1.0 / max(num_layers, 1),
-            )
-        else:
-            if len(weights) != num_layers:
-                raise ValueError(
-                    "presence_layer_loss_weights length must match presence "
-                    f"layers: got {len(weights)} weights for {num_layers} layers."
-                )
-            weights_tensor = presence_logits_layers.new_tensor(list(weights))
-
-        total_loss = presence_logits_layers.sum() * 0.0
-        log_items: Dict[str, torch.Tensor] = {}
-
-        for layer_idx in range(num_layers):
-            layer_loss = self._presence_bce_loss(
-                presence_logits=presence_logits_layers[layer_idx],
-                presence_target=presence_target,
-                presence_valid_mask=presence_valid_mask,
-            )
-
-            layer_weighted_loss = weights_tensor[layer_idx] * layer_loss
-            total_loss = total_loss + layer_weighted_loss
-
-            # Unweighted per-layer BCE, easier to compare across layers.
-            log_items[f"loss_presence_layer_{layer_idx}_bce"] = layer_loss.detach()
-
-            # Weighted contribution to total presence loss.
-            log_items[f"loss_presence_layer_{layer_idx}_weighted"] = (
-                layer_weighted_loss.detach()
-            )
-
-        return total_loss, log_items
+        valid = presence_valid_mask.to(dtype=per_elem.dtype)
+        return (per_elem * valid).sum() / valid.sum().clamp_min(1.0)
 
     def _final_ignore_bce_loss(
         self,
@@ -279,7 +435,6 @@ class SemanticCriterion(nn.Module):
                 "ignore-region consistency loss, "
                 f"got {tuple(final_logits.shape)} and {tuple(semantic_logits.shape)}."
             )
-
         if valid_mask.shape != final_logits.shape:
             raise ValueError(
                 "valid_mask must have the same shape as final_logits, "
@@ -287,29 +442,62 @@ class SemanticCriterion(nn.Module):
             )
 
         ignore_mask = ~valid_mask
-
         if not ignore_mask.any():
-            return final_logits.sum() * 0.0
+            return self._zero_loss(final_logits)
 
         teacher_prob = semantic_logits.detach().sigmoid()
-
         per_elem = F.binary_cross_entropy_with_logits(
             final_logits,
             teacher_prob,
             reduction="none",
         )
 
-        ignore_mask = ignore_mask.to(dtype=per_elem.dtype)
-        per_elem = per_elem * ignore_mask
+        ignore_weight = ignore_mask.to(dtype=per_elem.dtype)
+        return (per_elem * ignore_weight).sum() / ignore_weight.sum().clamp_min(1.0)
 
-        denom = ignore_mask.sum().clamp_min(1.0)
-        return per_elem.sum() / denom
-
-    def _build_dynamic_class_weights(
+    def _basic_mask_losses(
         self,
+        logits: torch.Tensor,
         target: torch.Tensor,
         valid_mask: torch.Tensor,
         present_pair_mask: torch.Tensor,
+        bce_class_weights: torch.Tensor,
+        ce_label_map: torch.Tensor,
+        ce_class_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        if present_pair_mask.any():
+            loss_bce = self._binary_cross_entropy_present_balanced_mean(
+                logits=logits,
+                target=target,
+                valid_mask=valid_mask,
+                present_pair_mask=present_pair_mask,
+                class_weights=bce_class_weights,
+            )
+            loss_dice = self._dice_loss_present_mean_from_logits(
+                logits=logits,
+                target=target,
+                valid_mask=valid_mask,
+                present_pair_mask=present_pair_mask,
+            )
+        else:
+            loss_bce = self._zero_loss(logits)
+            loss_dice = self._zero_loss(logits)
+
+        loss_ce, num_ce_valid = self._cross_entropy_loss(
+            logits=logits,
+            ce_label_map=ce_label_map,
+            present_pair_mask=present_pair_mask,
+            ce_class_weights=ce_class_weights,
+        )
+        return loss_bce, loss_dice, loss_ce, num_ce_valid
+
+    @staticmethod
+    def _build_dynamic_pair_weights(
+        target: torch.Tensor,
+        valid_mask: torch.Tensor,
+        present_pair_mask: torch.Tensor,
+        clamp_min: float,
+        clamp_max: float,
     ) -> torch.Tensor:
         target_valid = target * valid_mask.to(dtype=target.dtype)
         fg_pixels = target_valid.flatten(2).sum(dim=2)
@@ -323,36 +511,10 @@ class SemanticCriterion(nn.Module):
                 mean_fg / fg_pixels[present_pair_mask].clamp_min(1.0)
             )
 
-        return class_weights.clamp(
-            min=float(self.cfg.bce_class_balance_clamp_min),
-            max=float(self.cfg.bce_class_balance_clamp_max),
-        )
+        return class_weights.clamp(min=float(clamp_min), max=float(clamp_max))
 
-    def _build_dynamic_ce_class_weights(
-        self,
-        target: torch.Tensor,
-        valid_mask: torch.Tensor,
-        present_pair_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        target_valid = target * valid_mask.to(dtype=target.dtype)
-        fg_pixels = target_valid.flatten(2).sum(dim=2)
-
-        class_weights = torch.zeros_like(fg_pixels, dtype=target.dtype)
-
-        if present_pair_mask.any():
-            present_fg = fg_pixels[present_pair_mask]
-            mean_fg = present_fg.mean().clamp_min(1.0)
-            class_weights[present_pair_mask] = (
-                mean_fg / fg_pixels[present_pair_mask].clamp_min(1.0)
-            )
-
-        return class_weights.clamp(
-            min=float(self.cfg.ce_class_balance_clamp_min),
-            max=float(self.cfg.ce_class_balance_clamp_max),
-        )
-
+    @staticmethod
     def _binary_cross_entropy_present_balanced_mean(
-        self,
         logits: torch.Tensor,
         target: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -426,153 +588,137 @@ class SemanticCriterion(nn.Module):
     ) -> tuple[torch.Tensor, int]:
         if logits.shape[0] != ce_label_map.shape[0]:
             raise ValueError(
-                f"Batch mismatch between logits and ce_label_map: "
+                "Batch mismatch between logits and ce_label_map: "
                 f"{tuple(logits.shape)} vs {tuple(ce_label_map.shape)}."
             )
 
         if logits.shape[-2:] != ce_label_map.shape[-2:]:
             raise ValueError(
-                f"Spatial mismatch between logits and ce_label_map: "
+                "Spatial mismatch between logits and ce_label_map: "
                 f"{tuple(logits.shape)} vs {tuple(ce_label_map.shape)}."
             )
 
         if present_pair_mask.shape != logits.shape[:2]:
             raise ValueError(
                 "present_pair_mask must be [B, C] matching logits, "
-                f"got {tuple(present_pair_mask.shape)} vs logits[:2]={tuple(logits.shape[:2])}."
+                f"got {tuple(present_pair_mask.shape)} vs "
+                f"logits[:2]={tuple(logits.shape[:2])}."
             )
 
         if ce_class_weights.shape != logits.shape[:2]:
             raise ValueError(
                 "ce_class_weights must be [B, C] matching logits, "
-                f"got {tuple(ce_class_weights.shape)} vs logits[:2]={tuple(logits.shape[:2])}."
+                f"got {tuple(ce_class_weights.shape)} vs "
+                f"logits[:2]={tuple(logits.shape[:2])}."
             )
 
-        batch_size, _, _, _ = logits.shape
+        batch_size = int(logits.shape[0])
         ignore_index = int(self.cfg.ignore_index)
 
-        total_loss = logits.sum() * 0.0
+        total_loss = self._zero_loss(logits)
         total_weight = logits.new_tensor(0.0)
         total_valid = 0
 
         for batch_idx in range(batch_size):
-            present_ids = torch.nonzero(
-                present_pair_mask[batch_idx],
-                as_tuple=False,
-            ).flatten()
-
-            if int(present_ids.numel()) <= 1:
-                continue
-
-            label_b = ce_label_map[batch_idx]
-            valid_pixel_mask = label_b != ignore_index
-            if int(valid_pixel_mask.sum().item()) <= 0:
-                continue
-
-            logits_b = logits[batch_idx:batch_idx + 1, present_ids]
-
-            local_label = torch.full_like(label_b, fill_value=ignore_index)
-            for local_idx, class_idx in enumerate(present_ids.tolist()):
-                local_label[label_b == int(class_idx)] = int(local_idx)
-
-            local_valid = local_label != ignore_index
-            num_local_valid = int(local_valid.sum().item())
-            if num_local_valid <= 0:
-                continue
-
-            ce_weight = ce_class_weights[batch_idx, present_ids].to(
-                device=logits_b.device,
-                dtype=logits_b.dtype,
-            )
-
-            per_pixel_loss = F.cross_entropy(
-                logits_b,
-                local_label[None],
-                weight=ce_weight,
+            loss_b, image_weight, num_valid = self._cross_entropy_loss_one_image(
+                logits=logits,
+                ce_label_map=ce_label_map,
+                present_pair_mask=present_pair_mask,
+                ce_class_weights=ce_class_weights,
+                batch_idx=batch_idx,
                 ignore_index=ignore_index,
-                reduction="none",
             )
+            if num_valid <= 0:
+                continue
 
-            safe_local_label = local_label.clamp(min=0)
-            safe_local_label = safe_local_label.clamp(
-                max=int(present_ids.numel()) - 1,
-            )
-
-            pixel_weight = ce_weight[safe_local_label].to(
-                device=per_pixel_loss.device,
-                dtype=per_pixel_loss.dtype,
-            )
-            pixel_weight = pixel_weight[None]
-
-            valid_float = local_valid[None].to(dtype=per_pixel_loss.dtype)
-            valid_weight = pixel_weight * valid_float
-
-            denom_b = valid_weight.sum().clamp_min(1.0)
-            loss_b = (per_pixel_loss * valid_float).sum() / denom_b
-
-            image_weight = valid_weight.sum().detach()
             total_loss = total_loss + loss_b * image_weight
             total_weight = total_weight + image_weight
-            total_valid += num_local_valid
+            total_valid += num_valid
 
         if total_valid <= 0:
-            return logits.sum() * 0.0, 0
+            return self._zero_loss(logits), 0
 
         return total_loss / total_weight.clamp_min(1.0), total_valid
 
-    def _basic_mask_losses(
+    def _cross_entropy_loss_one_image(
         self,
         logits: torch.Tensor,
-        target: torch.Tensor,
-        valid_mask: torch.Tensor,
-        present_pair_mask: torch.Tensor,
-        class_weights: torch.Tensor,
         ce_label_map: torch.Tensor,
+        present_pair_mask: torch.Tensor,
         ce_class_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        if present_pair_mask.any():
-            loss_bce = self._binary_cross_entropy_present_balanced_mean(
-                logits=logits,
-                target=target,
-                valid_mask=valid_mask,
-                present_pair_mask=present_pair_mask,
-                class_weights=class_weights,
-            )
-            loss_dice = self._dice_loss_present_mean_from_logits(
-                logits=logits,
-                target=target,
-                valid_mask=valid_mask,
-                present_pair_mask=present_pair_mask,
-            )
-        else:
-            loss_bce = logits.sum() * 0.0
-            loss_dice = logits.sum() * 0.0
+        batch_idx: int,
+        ignore_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        present_ids = torch.nonzero(
+            present_pair_mask[batch_idx],
+            as_tuple=False,
+        ).flatten()
 
-        loss_ce, num_ce_valid = self._cross_entropy_loss(
-            logits=logits,
-            ce_label_map=ce_label_map,
-            present_pair_mask=present_pair_mask,
-            ce_class_weights=ce_class_weights,
+        if int(present_ids.numel()) <= 1:
+            return self._zero_loss(logits), logits.new_tensor(0.0), 0
+
+        label_b = ce_label_map[batch_idx]
+        valid_pixel_mask = label_b != ignore_index
+        if int(valid_pixel_mask.sum().item()) <= 0:
+            return self._zero_loss(logits), logits.new_tensor(0.0), 0
+
+        logits_b = logits[batch_idx:batch_idx + 1, present_ids]
+
+        local_label = torch.full_like(label_b, fill_value=ignore_index)
+        for local_idx, class_idx in enumerate(present_ids.tolist()):
+            local_label[label_b == int(class_idx)] = int(local_idx)
+
+        local_valid = local_label != ignore_index
+        num_local_valid = int(local_valid.sum().item())
+        if num_local_valid <= 0:
+            return self._zero_loss(logits), logits.new_tensor(0.0), 0
+
+        ce_weight = ce_class_weights[batch_idx, present_ids].to(
+            device=logits_b.device,
+            dtype=logits_b.dtype,
         )
 
-        return loss_bce, loss_dice, loss_ce, num_ce_valid
+        per_pixel_loss = F.cross_entropy(
+            logits_b,
+            local_label[None],
+            weight=ce_weight,
+            ignore_index=ignore_index,
+            reduction="none",
+        )
+
+        safe_local_label = local_label.clamp(min=0)
+        safe_local_label = safe_local_label.clamp(max=int(present_ids.numel()) - 1)
+
+        pixel_weight = ce_weight[safe_local_label].to(
+            device=per_pixel_loss.device,
+            dtype=per_pixel_loss.dtype,
+        )
+        pixel_weight = pixel_weight[None]
+
+        valid_float = local_valid[None].to(dtype=per_pixel_loss.dtype)
+        valid_weight = pixel_weight * valid_float
+
+        denom_b = valid_weight.sum().clamp_min(1.0)
+        loss_b = (per_pixel_loss * valid_float).sum() / denom_b
+        image_weight = valid_weight.sum().detach()
+
+        return loss_b, image_weight, num_local_valid
 
     def _aux_mask_layer_losses(
         self,
-        outputs: Dict[str, torch.Tensor],
+        outputs: TensorDict,
         final_logits: torch.Tensor,
         target: torch.Tensor,
         valid_mask: torch.Tensor,
         present_pair_mask: torch.Tensor,
-        class_weights: torch.Tensor,
+        bce_class_weights: torch.Tensor,
         ce_label_map: torch.Tensor,
         ce_class_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, TensorDict]:
         mask_logits_layers = outputs.get(OUTPUT_KEYS.mask_logits_layers, None)
 
         if mask_logits_layers is None:
-            zero = final_logits.sum() * 0.0
-            return zero, {}
+            return self._zero_loss(final_logits), {}
 
         if mask_logits_layers.dim() != 5:
             raise ValueError(
@@ -589,44 +735,34 @@ class SemanticCriterion(nn.Module):
 
         num_layers = int(mask_logits_layers.shape[0])
         num_aux_layers = max(num_layers - 1, 0)
-
         if num_aux_layers == 0:
-            zero = final_logits.sum() * 0.0
-            return zero, {}
+            return self._zero_loss(final_logits), {}
 
-        weights = self.cfg.mask_layer_weights
-        if weights is None:
-            weights_tensor = mask_logits_layers.new_ones(num_aux_layers)
-        else:
-            if len(weights) != num_aux_layers:
-                raise ValueError(
-                    "mask_layer_weights length must equal len(mask_logits_layers) - 1. "
-                    f"Got {len(weights)} weights for {num_aux_layers} aux layers."
-                )
-            weights_tensor = mask_logits_layers.new_tensor(list(weights))
+        weights_tensor = self._build_aux_mask_layer_weights(
+            mask_logits_layers=mask_logits_layers,
+            num_aux_layers=num_aux_layers,
+        )
 
-        aux_total = final_logits.sum() * 0.0
-        loss_dict: Dict[str, torch.Tensor] = {}
+        aux_total = self._zero_loss(final_logits)
+        loss_dict: TensorDict = {}
 
         for layer_idx in range(num_aux_layers):
             layer_logits = mask_logits_layers[layer_idx]
-
             loss_bce, loss_dice, loss_ce, _ = self._basic_mask_losses(
                 logits=layer_logits,
                 target=target,
                 valid_mask=valid_mask,
                 present_pair_mask=present_pair_mask,
-                class_weights=class_weights,
+                bce_class_weights=bce_class_weights,
                 ce_label_map=ce_label_map,
                 ce_class_weights=ce_class_weights,
             )
 
             layer_total = (
-                    float(self.cfg.final_bce_weight) * loss_bce
-                    + float(self.cfg.final_dice_weight) * loss_dice
-                    + float(self.cfg.final_ce_weight) * loss_ce
+                float(self.cfg.final_bce_weight) * loss_bce
+                + float(self.cfg.final_dice_weight) * loss_dice
+                + float(self.cfg.final_ce_weight) * loss_ce
             )
-
             weighted_layer_total = weights_tensor[layer_idx] * layer_total
             aux_total = aux_total + weighted_layer_total
 
@@ -640,187 +776,21 @@ class SemanticCriterion(nn.Module):
 
         return aux_total, loss_dict
 
-    def _forward_final(
+    def _build_aux_mask_layer_weights(
         self,
-        outputs: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        semantic_logits = self._extract_required_logits(
-            outputs,
-            OUTPUT_KEYS.semantic_logits,
-        )
-        final_logits = self._extract_required_logits(
-            outputs,
-            OUTPUT_KEYS.final_logits,
-        )
-        presence_logits = self._extract_required_class_logits(
-            outputs,
-            OUTPUT_KEYS.presence_logits,
-        )
+        mask_logits_layers: torch.Tensor,
+        num_aux_layers: int,
+    ) -> torch.Tensor:
+        weights = self.cfg.mask_layer_weights
+        if weights is None:
+            return mask_logits_layers.new_ones(num_aux_layers)
 
-        if final_logits.shape != semantic_logits.shape:
+        if len(weights) != num_aux_layers:
             raise ValueError(
-                "final_logits and semantic_logits must have the same shape, "
-                f"got {tuple(final_logits.shape)} and {tuple(semantic_logits.shape)}."
+                "mask_layer_weights length must equal len(mask_logits_layers) - 1. "
+                f"Got {len(weights)} weights for {num_aux_layers} aux layers."
             )
-
-        if presence_logits.shape != semantic_logits.shape[:2]:
-            raise ValueError(
-                "presence_logits must be [B, C] matching semantic_logits, "
-                f"got {tuple(presence_logits.shape)} and "
-                f"semantic_logits.shape[:2]={tuple(semantic_logits.shape[:2])}."
-            )
-
-        label_map = self._extract_label_map(targets)
-        label_map = self._resize_label_map_to_logits(
-            label_map=label_map,
-            target_hw=tuple(final_logits.shape[-2:]),
-        )
-
-        num_channels = int(final_logits.shape[1])
-        class_ids = list(range(num_channels))
-
-        target, valid_mask = self._build_targets(
-            label_map=label_map,
-            class_ids=class_ids,
-            num_channels=num_channels,
-        )
-        present_pair_mask = self._build_present_pair_mask(
-            target=target,
-            valid_mask=valid_mask,
-        )
-        presence_target, presence_valid_mask = self._build_presence_target(
-            target=target,
-            valid_mask=valid_mask,
-        )
-
-        num_valid_pixels = int((label_map != int(self.cfg.ignore_index)).sum().item())
-        zero = final_logits.sum() * 0.0
-
-        loss_final_ignore_bce = self._final_ignore_bce_loss(
-            final_logits=final_logits,
-            semantic_logits=semantic_logits,
-            valid_mask=valid_mask,
-        )
-
-        loss_presence_bce, presence_loss_log_items = self._presence_loss_from_outputs(
-            outputs=outputs,
-            presence_logits=presence_logits,
-            presence_target=presence_target,
-            presence_valid_mask=presence_valid_mask,
-        )
-
-        if num_valid_pixels <= 0:
-            total_loss = (
-                    float(self.cfg.final_ignore_bce_weight) * loss_final_ignore_bce
-                    + float(self.cfg.presence_loss_weight) * loss_presence_bce
-            )
-
-            loss_dict = {
-                "loss_final_bce": zero,
-                "loss_final_dice": zero,
-                "loss_final_ce": zero,
-                "loss_final_ignore_bce": loss_final_ignore_bce,
-                "loss_presence_bce": loss_presence_bce,
-                "loss_mask_layers_aux": zero,
-                "total_loss": total_loss,
-                "num_valid": torch.tensor(
-                    0,
-                    device=final_logits.device,
-                    dtype=torch.long,
-                ),
-            }
-            loss_dict.update(presence_loss_log_items)
-            return loss_dict
-
-        class_weights = self._build_dynamic_class_weights(
-            target=target,
-            valid_mask=valid_mask,
-            present_pair_mask=present_pair_mask,
-        )
-
-        ce_class_weights = self._build_dynamic_ce_class_weights(
-            target=target,
-            valid_mask=valid_mask,
-            present_pair_mask=present_pair_mask,
-        )
-
-        ce_label_map = self._build_ce_label_map(
-            label_map=label_map,
-            class_ids=class_ids,
-        )
-
-        loss_final_bce, loss_final_dice, loss_final_ce, num_ce_valid = (
-            self._basic_mask_losses(
-                logits=final_logits,
-                target=target,
-                valid_mask=valid_mask,
-                present_pair_mask=present_pair_mask,
-                class_weights=class_weights,
-                ce_label_map=ce_label_map,
-                ce_class_weights=ce_class_weights,
-            )
-        )
-
-        loss_aux_mask_layers, aux_loss_dict = self._aux_mask_layer_losses(
-            outputs=outputs,
-            final_logits=final_logits,
-            target=target,
-            valid_mask=valid_mask,
-            present_pair_mask=present_pair_mask,
-            class_weights=class_weights,
-            ce_label_map=ce_label_map,
-            ce_class_weights=ce_class_weights,
-        )
-
-        total_loss = (
-            float(self.cfg.final_bce_weight) * loss_final_bce
-            + float(self.cfg.final_dice_weight) * loss_final_dice
-            + float(self.cfg.final_ce_weight) * loss_final_ce
-            + float(self.cfg.final_ignore_bce_weight) * loss_final_ignore_bce
-            + float(self.cfg.presence_loss_weight) * loss_presence_bce
-            + loss_aux_mask_layers
-        )
-
-        loss_dict = {
-            "loss_final_bce": loss_final_bce,
-            "loss_final_dice": loss_final_dice,
-            "loss_final_ce": loss_final_ce,
-            "loss_final_ignore_bce": loss_final_ignore_bce,
-            "loss_presence_bce": loss_presence_bce,
-            "total_loss": total_loss,
-            "num_valid": torch.tensor(
-                max(num_valid_pixels, num_ce_valid),
-                device=final_logits.device,
-                dtype=torch.long,
-            ),
-        }
-        loss_dict.update(presence_loss_log_items)
-        loss_dict.update(aux_loss_dict)
-        return loss_dict
-
-    def forward(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor],
-        chunk_class_ids: Optional[Sequence[int]] = None,
-        reduction: str = "mean",
-    ) -> Dict[str, torch.Tensor]:
-        if reduction != "mean":
-            raise ValueError(
-                f"SemanticCriterion only supports reduction='mean', got {reduction!r}."
-            )
-
-        if OUTPUT_KEYS.final_logits not in outputs:
-            raise ValueError(
-                "SemanticCriterion only supports final-stage outputs. "
-                "Chunk-stage semantic loss has been removed."
-            )
-
-        return self._forward_final(
-            outputs=outputs,
-            targets=targets,
-        )
+        return mask_logits_layers.new_tensor(list(weights))
 
 
 class HybridCriterion(nn.Module):

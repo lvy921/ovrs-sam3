@@ -220,7 +220,3 @@ class VisualizerConfig:
 
     image_folder_pattern: str = "image_{image_id:06d}"
     ignore_index: int = 255
-
-    save_modulated_semantic_prediction: bool = False
-    save_delta_heatmaps: bool = False
-    save_modulated_semantic_heatmaps: bool = False

@@ -258,6 +258,14 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         cfg.adapter_cfg = cls._coerce_adapter_cfg(cfg.adapter_cfg)
         return cfg
 
+    @classmethod
+    def build_config(cls, **kwargs) -> SegmentorBuildConfig:
+        cfg = SegmentorBuildConfig(**kwargs)
+        cfg = cls._normalize_build_cfg(cfg)
+        cfg.openclip_cfg = cls.validate_openclip_cfg(cfg.openclip_cfg)
+        cfg.final_mixer_cfg = cls.validate_final_mixer_cfg(cfg.final_mixer_cfg)
+        return cfg
+
     @staticmethod
     def _require_dict(obj, name: str) -> dict:
         if not isinstance(obj, dict):
@@ -670,11 +678,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_semantic_core_model(cls, cfg: SegmentorBuildConfig) -> nn.Module:
-        cfg = cls._normalize_build_cfg(cfg)
-        cfg.openclip_cfg = cls.validate_openclip_cfg(cfg.openclip_cfg)
-        cfg.final_mixer_cfg = cls.validate_final_mixer_cfg(cfg.final_mixer_cfg)
-
-        bpe_path = cfg.bpe_path or resolve_bpe_path(cfg.bpe_path)
+        bpe_path = resolve_bpe_path(cfg.bpe_path)
         compile_mode = "default" if cfg.compile else None
 
         position_encoding = cls._create_position_encoding(precompute_resolution=1008)
@@ -757,8 +761,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_adapter(cls, cfg: SegmentorBuildConfig) -> nn.Module:
-        cfg = cls._normalize_build_cfg(cfg)
-
         if cfg.task_mode == TASK_MODE_SEMANTIC:
             return SemanticSegAdapter()
 
@@ -769,8 +771,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_criterion(cls, cfg: SegmentorBuildConfig) -> nn.Module:
-        cfg = cls._normalize_build_cfg(cfg)
-
         if cfg.task_mode == TASK_MODE_SEMANTIC:
             return SemanticCriterion(cfg=cfg.criterion_cfg)
 
@@ -781,8 +781,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_semantic_segmentor(cls, cfg: SegmentorBuildConfig) -> nn.Module:
-        cfg = cls._normalize_build_cfg(cfg)
-
         core_model = cls.build_semantic_core_model(cfg)
         adapter = cls.build_adapter(cfg)
 
@@ -808,7 +806,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_hybrid_segmentor(cls, cfg: SegmentorBuildConfig) -> nn.Module:
-        cfg = cls._normalize_build_cfg(cfg)
         raise NotImplementedError(
             "Hybrid task mode is not implemented yet. "
             "The current codebase only supports semantic mode."
@@ -816,8 +813,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_segmentor(cls, cfg: SegmentorBuildConfig) -> nn.Module:
-        cfg = cls._normalize_build_cfg(cfg)
-
         if cfg.task_mode == TASK_MODE_SEMANTIC:
             return cls.build_semantic_segmentor(cfg)
 
@@ -831,7 +826,6 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         cls,
         cfg: SegmentorBuildConfig,
     ) -> tuple[nn.Module, nn.Module]:
-        cfg = cls._normalize_build_cfg(cfg)
         model = cls.build_segmentor(cfg)
         criterion = cls.build_criterion(cfg)
         return model, criterion

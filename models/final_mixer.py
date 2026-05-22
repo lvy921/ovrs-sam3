@@ -655,7 +655,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
                 DynamicTextAlignedMaskFusionLayer(
                     hidden_dim=self.sam_dim,
                     num_heads=self.num_heads,
-                    dropout=float(dropout),
+                    dropout=self.window_dropout,
                     presence_enabled=self.presence_enabled,
                     window_size=self.window_size,
                     shift_size=layer_shift_size,

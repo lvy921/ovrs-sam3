@@ -145,6 +145,30 @@ class Sam3Image(torch.nn.Module):
                 f"num_class_tokens must be positive, got {self.num_class_tokens}."
             )
 
+        self.global_clip_sam_feature_builder = None
+        if self.clip_align_dim is not None:
+            self.global_clip_sam_feature_builder = GlobalClipSamFeatureBuilder(
+                clip_dim=self.clip_align_dim,
+                sam_dim=self.hidden_dim,
+                clip_feature_dim=self.hidden_dim,
+                attn_dim=self.clip_align_dim,
+                num_heads=self.final_mixer_num_heads,
+                dropout=self.final_mixer_dropout,
+                num_text_latents=self.num_clip_text_latents,
+            )
+
+        self.clip_sam_upsampler = None
+        if self.clip_sam_upsample_enabled:
+            self.clip_sam_upsampler = SamGuidedClipSamUpsampler(
+                hidden_dim=self.hidden_dim,
+                num_heads=self.final_mixer_num_heads,
+                window_size=self.clip_sam_upsample_window_size,
+                shift_size=self.clip_sam_upsample_shift_size,
+                dropout=self.clip_sam_upsample_dropout,
+                gamma_init=self.clip_sam_upsample_gamma_init,
+                gamma_max=self.clip_sam_upsample_gamma_max,
+            )
+
         self.presence_enabled = bool(presence_enabled)
 
         self.class_token_query_embed = nn.Parameter(
