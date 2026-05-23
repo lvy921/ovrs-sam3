@@ -32,7 +32,6 @@ model = dict(
             "an overhead view of {}.",
         ],
         num_prompt_templates=4,
-        num_clip_text_latents=32,
         normalize_label_for_clip=True,
     ),
 
@@ -45,23 +44,25 @@ model = dict(
         dropout=0.1,
         presence_enabled=True,
 
+        clip_sam_feature_cfg=dict(
+            enabled=True,
+            use_image_residual=False,
+        ),
+
         clip_sam_upsample_cfg=dict(
             enabled=True,
             window_size=8,
             shift_size=4,
             dropout=0.1,
-            gamma_init=1.0,
-            gamma_max=2.0,
         ),
 
-        dynamic_code_cfg=dict(
-            source="class_token_to_sam3_text",
+        class_code_cfg=dict(
+            source="mean_class_tokens",
         ),
 
-        mask_prior_cfg=dict(
-            type="softmax",
+        semantic_prior_cfg=dict(
+            type="presence_signed_softmax",
             tau=16.0,
-            multiply_presence=True,
         ),
 
         window_attention_cfg=dict(
@@ -71,7 +72,7 @@ model = dict(
         ),
 
         mask_head_cfg=dict(
-            type="attn_feature_dot_dynamic_code",
+            type="mask_embed_dot_class_code",
             direct_dot=True,
             class_feature_pool_stride=4,
         ),
@@ -80,15 +81,6 @@ model = dict(
     freeze_cfg=dict(
         train_adapters_only=True,
         trainable_modules=[
-            "core.global_clip_sam_feature_builder",
-            "core.clip_sam_upsampler",
-
-            "core.class_token_query_embed",
-            "core.class_token_text_cross_attn",
-            "core.class_token_text_cross_attn_norm",
-            "core.class_token_encoder_cross_attn",
-            "core.class_token_encoder_cross_attn_norm",
-
             "core.final_mixer",
         ],
         frozen_modules=[],
@@ -102,7 +94,7 @@ model = dict(
         final_bce_weight=0.4,
         final_dice_weight=1.0,
         final_ce_weight=0.4,
-        final_ignore_bce_weight=0.1,
+        final_ignore_bce_weight=0.0,
 
         presence_loss_weight=1.0,
         presence_layer_loss_weights=[0.02, 0.05, 0.1, 0.2],
@@ -146,66 +138,9 @@ optim_wrapper = dict(
         paramwise_cfg=dict(
             norm_decay_mult=0.0,
             custom_keys={
-                "core.global_clip_sam_feature_builder": dict(
-                    lr_mult=2.0,
-                    decay_mult=1.0,
-                ),
-
-                "core.clip_sam_upsampler": dict(
-                    lr_mult=4.0,
-                    decay_mult=1.0,
-                ),
-
-                "core.clip_sam_upsampler.window_attn.q_proj": dict(
-                    lr_mult=10.0,
-                    decay_mult=0.0,
-                ),
-                "core.clip_sam_upsampler.window_attn.k_proj": dict(
-                    lr_mult=10.0,
-                    decay_mult=0.0,
-                ),
-                "core.clip_sam_upsampler.shifted_window_attn.q_proj": dict(
-                    lr_mult=10.0,
-                    decay_mult=0.0,
-                ),
-                "core.clip_sam_upsampler.shifted_window_attn.k_proj": dict(
-                    lr_mult=10.0,
-                    decay_mult=0.0,
-                ),
-
-                "core.class_token_query_embed": dict(
-                    lr_mult=4.0,
-                    decay_mult=0.0,
-                ),
-                "core.class_token_text_cross_attn": dict(
-                    lr_mult=4.0,
-                    decay_mult=1.0,
-                ),
-                "core.class_token_text_cross_attn_norm": dict(
-                    lr_mult=4.0,
-                    decay_mult=0.0,
-                ),
-                "core.class_token_encoder_cross_attn": dict(
-                    lr_mult=4.0,
-                    decay_mult=1.0,
-                ),
-                "core.class_token_encoder_cross_attn_norm": dict(
-                    lr_mult=4.0,
-                    decay_mult=0.0,
-                ),
-
                 "core.final_mixer": dict(
                     lr_mult=4.0,
                     decay_mult=1.0,
-                ),
-
-                "mask_feature_attn.q_proj": dict(
-                    lr_mult=10.0,
-                    decay_mult=0.0,
-                ),
-                "mask_feature_attn.k_proj": dict(
-                    lr_mult=10.0,
-                    decay_mult=0.0,
                 ),
             },
         ),

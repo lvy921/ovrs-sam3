@@ -303,6 +303,47 @@ class SemanticSegAdapter(nn.Module):
                 )
             outputs[OUTPUT_KEYS.mask_logits_layers] = mask_logits_layers
 
+        clip_coarse_logits = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.clip_coarse_logits,
+        )
+        if clip_coarse_logits is not None:
+            clip_coarse_logits = self._ensure_4d_map(
+                clip_coarse_logits,
+                OUTPUT_KEYS.clip_coarse_logits,
+            )
+            self._validate_same_shape(
+                clip_coarse_logits,
+                final_logits,
+                OUTPUT_KEYS.clip_coarse_logits,
+                OUTPUT_KEYS.final_logits,
+            )
+            outputs[OUTPUT_KEYS.clip_coarse_logits] = clip_coarse_logits
+
+        clip_coarse_pred = self._extract_optional_tensor(
+            raw_outputs,
+            OUTPUT_KEYS.clip_coarse_pred,
+        )
+        if clip_coarse_pred is not None:
+            if clip_coarse_pred.dim() != 3:
+                raise ValueError(
+                    "clip_coarse_pred must be [B, H, W], "
+                    f"got {tuple(clip_coarse_pred.shape)}."
+                )
+
+            expected_pred_shape = (
+                int(final_logits.shape[0]),
+                int(final_logits.shape[2]),
+                int(final_logits.shape[3]),
+            )
+            if tuple(clip_coarse_pred.shape) != expected_pred_shape:
+                raise ValueError(
+                    "clip_coarse_pred shape mismatch: expected "
+                    f"{expected_pred_shape}, got {tuple(clip_coarse_pred.shape)}."
+                )
+
+            outputs[OUTPUT_KEYS.clip_coarse_pred] = clip_coarse_pred.long()
+
         return outputs
 
     def forward(

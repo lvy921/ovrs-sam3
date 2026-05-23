@@ -149,39 +149,36 @@ class Trainer:
         }
 
     def _compute_train_loss(self, batch) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        if not hasattr(self.model, "build_shared_clip_feature"):
-            raise AttributeError("Model must provide build_shared_clip_feature(batch).")
-
-        if not hasattr(self.model, "build_sam3_pixel_feature"):
-            raise AttributeError("Model must provide build_sam3_pixel_feature(batch).")
-
         if not hasattr(self.model, "iter_chunk_outputs"):
             raise AttributeError(
-                "Model must provide iter_chunk_outputs(batch, shared_clip_feature)."
+                "Model must provide iter_chunk_outputs(batch)."
             )
 
         if not hasattr(self.model, "run_final_mixer_from_chunks"):
             raise AttributeError(
-                "Model must provide run_final_mixer_from_chunks(...)."
+                "Model must provide run_final_mixer_from_chunks(mixer_cache, batch)."
             )
 
         label_map = batch.find_targets[0].semantic_label_map
         use_amp = self.cfg.use_amp and self.device.type == "cuda"
 
         with autocast(device_type=self.device.type, enabled=use_amp):
-            shared_clip_feature = self.model.build_shared_clip_feature(batch)
-            sam3_feature_high = self.model.build_sam3_pixel_feature(batch)
-
             mixer_cache = [
                 self._build_final_mixer_cache_item(chunk)
-                for chunk in self.model.iter_chunk_outputs(
-                    batch,
-                    shared_clip_feature=shared_clip_feature,
-                )
+                for chunk in self.model.iter_chunk_outputs(batch)
             ]
 
             if len(mixer_cache) == 0:
-                zero = shared_clip_feature.sum() * 0.0
+                try:
+                    ref_param = next(self.model.parameters())
+                    zero = ref_param.sum() * 0.0
+                except StopIteration:
+                    zero = torch.zeros(
+                        (),
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+
                 loss_dict = {
                     "total_loss": zero,
                     "num_valid": torch.tensor(
@@ -195,8 +192,6 @@ class Trainer:
             final_raw_outputs = self.model.run_final_mixer_from_chunks(
                 mixer_cache=mixer_cache,
                 batch=batch,
-                shared_clip_feature=shared_clip_feature,
-                sam3_feature_high=sam3_feature_high,
             )
 
             final_outputs = self.model.adapter(

@@ -457,27 +457,43 @@ class Sam3DirectSegmentationTask(VisualizationTask):
             ).save(sample_dir / "sam3_direct_overlay.png")
 
 
-class ClipImageTextScoreTask(VisualizationTask):
-    name = "clip_image_text_score"
+class ClipCoarsePredictionTask(VisualizationTask):
+    name = "clip_coarse_prediction"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
-        if not manager.cfg.save_clip_argmax_prediction:
+        if not manager.cfg.save_clip_coarse_prediction:
             return
 
-        clip_score_map = manager._build_clip_image_text_score_map_for_visualization(
-            model=ctx.model,
-            batch=ctx.batch,
-        )
-        if clip_score_map is None:
+        outputs = ctx.semantic_outputs
+
+        clip_coarse_pred = outputs.get(OUTPUT_KEYS.clip_coarse_pred, None)
+        clip_coarse_logits = outputs.get(OUTPUT_KEYS.clip_coarse_logits, None)
+
+        if clip_coarse_pred is None and clip_coarse_logits is not None:
+            if clip_coarse_logits.dim() != 4:
+                raise ValueError(
+                    "clip_coarse_logits must be [B, C, H, W], "
+                    f"got {tuple(clip_coarse_logits.shape)}."
+                )
+            clip_coarse_pred = clip_coarse_logits.argmax(dim=1)
+
+        if clip_coarse_pred is None:
             return
 
-        if clip_score_map.dim() != 4:
+        if clip_coarse_pred.dim() != 3:
             raise ValueError(
-                f"Expected clip_score_map as [B, C, Hc, Wc], "
-                f"got {tuple(clip_score_map.shape)}."
+                "clip_coarse_pred must be [B, H, W], "
+                f"got {tuple(clip_coarse_pred.shape)}."
             )
 
-        num_classes = int(clip_score_map.shape[1])
+        if clip_coarse_logits is not None:
+            num_classes = int(clip_coarse_logits.shape[1])
+        else:
+            try:
+                class_names = list(ctx.batch.find_metadatas[0].class_names)
+                num_classes = len(class_names)
+            except Exception:
+                num_classes = int(clip_coarse_pred.max().item()) + 1
 
         for b in ctx.selected_indices:
             image_id = manager._extract_image_id(ctx.batch, b)
@@ -490,25 +506,29 @@ class ClipImageTextScoreTask(VisualizationTask):
             overlay_image = manager._extract_overlay_image(ctx.batch, b)
             out_hw = overlay_image.size[::-1]
 
-            clip_score_up = F.interpolate(
-                clip_score_map[b:b + 1],
-                size=out_hw,
-                mode="bilinear",
-                align_corners=False,
-            )[0]
-
-            clip_pred = clip_score_up.argmax(dim=0).long()
+            coarse_pred = manager._prepare_label_map(
+                clip_coarse_pred[b],
+                out_hw,
+            )
 
             manager._colorize_label_map(
-                clip_pred.detach().cpu(),
+                coarse_pred.detach().cpu(),
                 num_classes=num_classes,
-            ).save(sample_dir / "clip_argmax_pred.png")
+            ).save(sample_dir / "clip_coarse_pred.png")
 
             manager._overlay_label_map(
                 overlay_image,
-                clip_pred.detach().cpu(),
+                coarse_pred.detach().cpu(),
                 num_classes=num_classes,
-            ).save(sample_dir / "clip_argmax_overlay.png")
+            ).save(sample_dir / "clip_coarse_overlay.png")
+
+            if clip_coarse_logits is not None:
+                coarse_score = clip_coarse_logits[b].softmax(dim=0).max(dim=0).values
+                manager._to_heatmap_image(
+                    coarse_score,
+                    out_hw=out_hw,
+                    normalize="prob",
+                ).save(sample_dir / "clip_coarse_score_heatmap.png")
 
 
 class VisualizationManager:
@@ -526,7 +546,7 @@ class VisualizationManager:
             PresenceScoreTask(),
             FinalMixerMaskLayerTask(),
             Sam3DirectSegmentationTask(),
-            ClipImageTextScoreTask(),
+            ClipCoarsePredictionTask(),
         ]
 
     @staticmethod
@@ -594,109 +614,6 @@ class VisualizationManager:
             direct_logits = semantic_seg_head(pixel_embed)
 
         return direct_logits.detach()
-
-    def _build_clip_image_text_score_map_for_visualization(
-        self,
-        model: torch.nn.Module,
-        batch: Any,
-    ) -> Optional[torch.Tensor]:
-        core = self._extract_core_model(model)
-        if core is None:
-            return None
-
-        required_attrs = [
-            "clip_image_encoder",
-            "clip_text_encoder",
-            "_prepare_openclip_image_batch",
-        ]
-        for name in required_attrs:
-            if not hasattr(core, name):
-                return None
-
-        if core.clip_image_encoder is None or core.clip_text_encoder is None:
-            return None
-
-        class_texts = list(getattr(batch, "find_text_batch", []))
-        if len(class_texts) == 0:
-            return None
-
-        raw_images = getattr(batch, "raw_images", None)
-        if raw_images is None:
-            return None
-
-        templates = list(getattr(core, "clip_prompt_templates", []))
-        if len(templates) == 0:
-            return None
-
-        normalize_label = bool(getattr(core, "normalize_label_for_clip", True))
-        device = core.device
-
-        with torch.no_grad():
-            clip_img_batch = core._prepare_openclip_image_batch(
-                raw_images=raw_images,
-                device=device,
-            )
-
-            clip_image_feat_map = core.clip_image_encoder(clip_img_batch)
-            if not isinstance(clip_image_feat_map, torch.Tensor):
-                return None
-            if clip_image_feat_map.dim() != 4:
-                raise ValueError(
-                    "clip_image_encoder must return [B, D_clip, Hc, Wc], "
-                    f"got {tuple(clip_image_feat_map.shape)}."
-                )
-
-            clip_text_tokens = core.clip_text_encoder.encode_prompt_templates(
-                class_names=class_texts,
-                templates=templates,
-                device=device,
-                normalize_label=normalize_label,
-                normalize=False,
-            )
-
-            if clip_text_tokens.dim() != 3:
-                raise ValueError(
-                    "Expected clip_text_tokens as [C, K, D_clip], "
-                    f"got {tuple(clip_text_tokens.shape)}."
-                )
-
-            batch_size, image_dim, grid_h, grid_w = clip_image_feat_map.shape
-            num_classes, _, text_dim = clip_text_tokens.shape
-
-            if int(image_dim) != int(text_dim):
-                raise ValueError(
-                    f"CLIP image/text dim mismatch: image_dim={image_dim}, "
-                    f"text_dim={text_dim}."
-                )
-
-            if int(num_classes) != len(class_texts):
-                raise ValueError(
-                    f"CLIP text class count mismatch: {num_classes} vs "
-                    f"{len(class_texts)}."
-                )
-
-            image_features = clip_image_feat_map.flatten(2).transpose(1, 2)
-            image_features = image_features.contiguous()
-            image_features = F.normalize(image_features, dim=-1, eps=1e-6)
-
-            text_features = F.normalize(clip_text_tokens, dim=-1, eps=1e-6)
-            text_features = text_features.mean(dim=1)
-            text_features = F.normalize(text_features, dim=-1, eps=1e-6)
-
-            clip_score = torch.einsum(
-                "bnd,cd->bcn",
-                image_features,
-                text_features,
-            )
-
-            clip_score_map = clip_score.reshape(
-                batch_size,
-                num_classes,
-                grid_h,
-                grid_w,
-            ).contiguous()
-
-        return clip_score_map.detach()
 
     def should_save(self, stage: str) -> bool:
         if not self.cfg.enabled:

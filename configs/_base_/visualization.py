@@ -25,8 +25,8 @@ visualization = dict(
     # If too many images are produced, change this to 8 or 16.
     max_final_mixer_layer_heatmap_classes=None,
 
-    # CLIP image-text argmax visualization.
-    save_clip_argmax_prediction=True,
+    # Final-mixer coarse CLIP segmentation visualization.
+    save_clip_coarse_prediction=True,
 
     # Frozen SAM3 direct segmentation visualization.
     save_sam3_direct_segmentation=True,

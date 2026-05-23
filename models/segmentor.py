@@ -41,18 +41,6 @@ class SAM3Segmentor(nn.Module):
             force=force,
         )
 
-    def build_shared_clip_feature(
-        self,
-        batch: BatchedDatapoint,
-    ) -> torch.Tensor:
-        return self.core.build_shared_clip_feature(batch)
-
-    def build_sam3_pixel_feature(
-        self,
-        batch: BatchedDatapoint,
-    ) -> torch.Tensor:
-        return self.core.build_sam3_pixel_feature(batch)
-
     @staticmethod
     def _build_mixer_cache_item(
         outputs: Dict[str, torch.Tensor],
@@ -85,12 +73,8 @@ class SAM3Segmentor(nn.Module):
     def iter_chunk_outputs(
         self,
         batch: BatchedDatapoint,
-        shared_clip_feature: Optional[torch.Tensor] = None,
     ) -> Iterator[Dict[str, Any]]:
-        for chunk in self.core.iter_chunk_raw_outputs(
-            batch,
-            shared_clip_feature=shared_clip_feature,
-        ):
+        for chunk in self.core.iter_chunk_raw_outputs(batch):
             raw_outputs = chunk["raw_outputs"]
             chunk_class_ids = chunk["chunk_class_ids"]
 
@@ -113,27 +97,17 @@ class SAM3Segmentor(nn.Module):
     def run_final_mixer_from_chunks(
         self,
         mixer_cache: List[Dict[str, torch.Tensor | list[int]]],
-        batch: Optional[BatchedDatapoint] = None,
-        shared_clip_feature: Optional[torch.Tensor] = None,
-        sam3_feature_high: Optional[torch.Tensor] = None,
+        batch: BatchedDatapoint,
     ) -> Dict[str, torch.Tensor]:
         return self.core.run_final_mixer_from_chunks(
             mixer_cache=mixer_cache,
             batch=batch,
-            shared_clip_feature=shared_clip_feature,
-            sam3_feature_high=sam3_feature_high,
         )
 
     def forward(self, batch: BatchedDatapoint) -> dict[str, torch.Tensor]:
-        shared_clip_feature = self.build_shared_clip_feature(batch)
-        sam3_feature_high = self.build_sam3_pixel_feature(batch)
-
         mixer_cache = []
 
-        for chunk in self.core.iter_chunk_raw_outputs(
-                batch,
-                shared_clip_feature=shared_clip_feature,
-        ):
+        for chunk in self.core.iter_chunk_raw_outputs(batch):
             raw_outputs = chunk["raw_outputs"]
 
             chunk_outputs = self.adapter(
@@ -154,8 +128,6 @@ class SAM3Segmentor(nn.Module):
         final_raw_outputs = self.run_final_mixer_from_chunks(
             mixer_cache=mixer_cache,
             batch=batch,
-            shared_clip_feature=shared_clip_feature,
-            sam3_feature_high=sam3_feature_high,
         )
 
         return self.adapter(

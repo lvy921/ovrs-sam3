@@ -29,6 +29,9 @@ class ModelOutputKeys:
 
     mask_logits_layers: str = "mask_logits_layers"
 
+    clip_coarse_logits: str = "clip_coarse_logits"
+    clip_coarse_pred: str = "clip_coarse_pred"
+
     sam3_pixel_feature: str = "sam3_pixel_feature"
 
 

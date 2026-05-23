@@ -28,9 +28,14 @@ class OpenCLIPConfig:
         ]
     )
     num_prompt_templates: int = 2
-    num_clip_text_latents: int = 32
 
     normalize_label_for_clip: bool = True
+
+
+@dataclass
+class ClipSamFeatureConfig:
+    enabled: bool = True
+    use_image_residual: bool = False
 
 
 @dataclass
@@ -39,20 +44,17 @@ class ClipSamUpsampleConfig:
     window_size: int = 8
     shift_size: int = 4
     dropout: float = 0.1
-    gamma_init: float = 1.0
-    gamma_max: float = 2.0
 
 
 @dataclass
-class DynamicCodeConfig:
-    source: str = "class_token_to_sam3_text"
+class ClassCodeConfig:
+    source: str = "mean_class_tokens"
 
 
 @dataclass
-class MaskPriorConfig:
-    type: str = "softmax"
+class SemanticPriorConfig:
+    type: str = "presence_signed_softmax"
     tau: float = 16.0
-    multiply_presence: bool = True
 
 
 @dataclass
@@ -64,7 +66,7 @@ class WindowAttentionConfig:
 
 @dataclass
 class MaskHeadConfig:
-    type: str = "attn_feature_dot_dynamic_code"
+    type: str = "mask_embed_dot_class_code"
     direct_dot: bool = True
     class_feature_pool_stride: int = 4
 
@@ -79,11 +81,16 @@ class FinalMixerConfig:
     dropout: float = 0.1
     presence_enabled: bool = True
 
+    clip_sam_feature_cfg: ClipSamFeatureConfig = field(
+        default_factory=ClipSamFeatureConfig
+    )
     clip_sam_upsample_cfg: ClipSamUpsampleConfig = field(
         default_factory=ClipSamUpsampleConfig
     )
-    dynamic_code_cfg: DynamicCodeConfig = field(default_factory=DynamicCodeConfig)
-    mask_prior_cfg: MaskPriorConfig = field(default_factory=MaskPriorConfig)
+    class_code_cfg: ClassCodeConfig = field(default_factory=ClassCodeConfig)
+    semantic_prior_cfg: SemanticPriorConfig = field(
+        default_factory=SemanticPriorConfig
+    )
     window_attention_cfg: WindowAttentionConfig = field(
         default_factory=WindowAttentionConfig
     )
@@ -200,7 +207,7 @@ class VisualizerConfig:
     save_score_heatmaps: bool = True
     heatmap_colormap: str = "turbo"
 
-    save_clip_argmax_prediction: bool = True
+    save_clip_coarse_prediction: bool = True
 
     save_sam3_direct_segmentation: bool = True
     sam3_direct_seg_threshold: float = 0.5
