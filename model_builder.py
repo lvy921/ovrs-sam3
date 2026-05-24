@@ -900,7 +900,10 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         if not save_dir.is_absolute():
             visualizer_cfg.save_dir = str(Path(work_dir) / save_dir)
 
-        return VisualizationManager(visualizer_cfg)
+        return VisualizationManager(
+            visualizer_cfg,
+            eval_cfg=cfg.get("eval_cfg", None),
+        )
 
     @classmethod
     def build_train_runtime_components(

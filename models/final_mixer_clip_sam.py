@@ -485,7 +485,7 @@ class CrossGuidedClipSamUpsampler(nn.Module):
 
         guided = self.shifted_window_attn(
             query_map=sam_map,
-            key_map=clip_high_base,
+            key_map=guided,
             value_map=guided,
         )
 

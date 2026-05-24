@@ -348,6 +348,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
             nn.Linear(self.hidden_dim, 1),
         )
 
+        self.semantic_prior_norm = nn.LayerNorm(self.hidden_dim)
         self.mask_embed_update_norm = nn.LayerNorm(self.hidden_dim)
         self.dropout = nn.Dropout(float(dropout))
 
@@ -601,6 +602,11 @@ class MaskEmbeddingFusionLayer(nn.Module):
             "bchw,bcd->bdhw",
             mask_prob,
             class_code,
+        ).contiguous()
+
+        prior_embed = self._normalize_map(
+            self.semantic_prior_norm,
+            prior_embed,
         )
 
         return prior_embed.contiguous()
