@@ -14,6 +14,7 @@ from ..config_dataclasses import VisualizerConfig
 from ..models.task_modes import OUTPUT_KEYS
 
 
+# 单次可视化调用共享的上下文，避免每个任务重复传一长串参数。
 @dataclass
 class VisualizationContext:
     model: torch.nn.Module
@@ -25,6 +26,7 @@ class VisualizationContext:
     selected_indices: List[int]
 
 
+# 所有可视化任务的基类；具体任务实现 run。
 class VisualizationTask:
     name = "base"
 
@@ -32,10 +34,12 @@ class VisualizationTask:
         raise NotImplementedError
 
 
+# 保存原图、最终预测、语义预测和真值的彩色图/overlay。
 class BaseSemanticOverlayTask(VisualizationTask):
     name = "base_semantic_overlay"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
+        # 从 adapter 输出中提取 final/semantic 两套 logits 与 score map。
         outputs = ctx.semantic_outputs
         targets = ctx.semantic_targets
         batch = ctx.batch
@@ -176,10 +180,12 @@ class BaseSemanticOverlayTask(VisualizationTask):
                         f.write(f"{i}\t{name}\n")
 
 
+# 保存 semantic/final score map 的统计摘要和每类 heatmap。
 class ScoreAnalysisTask(VisualizationTask):
     name = "score_analysis"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
+        # 比较 SAM3 粗分数和 final mixer 分数，便于观察 final mixer 的修正效果。
         outputs = ctx.semantic_outputs
         batch = ctx.batch
 
@@ -241,10 +247,12 @@ class ScoreAnalysisTask(VisualizationTask):
                 )
 
 
+# 保存类别 presence 分数和各层 presence logits。
 class PresenceScoreTask(VisualizationTask):
     name = "presence_score"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
+        # presence_score 表示每个类别在当前图像中是否出现的概率。
         if not manager.cfg.save_presence_scores:
             return
 
@@ -321,10 +329,12 @@ class PresenceScoreTask(VisualizationTask):
                 )
 
 
+# 保存 final mixer 每层 mask logits 的预测、heatmap 和 overlay。
 class FinalMixerMaskLayerTask(VisualizationTask):
     name = "final_mixer_mask_layers"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
+        # mask_logits_layers 的形状为 [L, B, C, H, W]。
         if not manager.cfg.save_final_mixer_mask_layers:
             return
 
@@ -384,10 +394,12 @@ class FinalMixerMaskLayerTask(VisualizationTask):
             )
 
 
+# 保存不经过 final mixer 的 SAM3 direct segmentation 结果，用于对照。
 class Sam3DirectSegmentationTask(VisualizationTask):
     name = "sam3_direct_segmentation"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
+        # direct logits 由 core 的 SAM3 粗分割路径生成。
         if not manager.cfg.save_sam3_direct_segmentation:
             return
 
@@ -445,10 +457,12 @@ class Sam3DirectSegmentationTask(VisualizationTask):
             ).save(sample_dir / "sam3_direct_overlay.png")
 
 
+# 保存 CLIP coarse prediction，观察 RemoteCLIP 粗语义提示本身的质量。
 class ClipCoarsePredictionTask(VisualizationTask):
     name = "clip_coarse_prediction"
 
     def run(self, manager: "VisualizationManager", ctx: VisualizationContext) -> None:
+        # clip_coarse_pred 可直接来自输出，也可由 clip_coarse_logits argmax 得到。
         if not manager.cfg.save_clip_coarse_prediction:
             return
 
@@ -518,6 +532,7 @@ class ClipCoarsePredictionTask(VisualizationTask):
                 ).save(sample_dir / "clip_coarse_score_heatmap.png")
 
 
+# 可视化管理器：选择样本、调度任务、提供图像/heatmap/overlay 保存工具。
 class VisualizationManager:
     def __init__(
         self,
@@ -549,6 +564,7 @@ class VisualizationManager:
         return bool(self.eval_cfg.get("use_score_map", True))
 
     def _build_tasks(self) -> List[VisualizationTask]:
+        # 根据配置开关，各 task 内部会自行决定是否真正保存。
         return [
             BaseSemanticOverlayTask(),
             ScoreAnalysisTask(),
@@ -572,6 +588,7 @@ class VisualizationManager:
         outputs: Dict[str, torch.Tensor],
         final_score_map: torch.Tensor,
     ) -> torch.Tensor:
+        # 按 evaluator 的 prob_thd/bg_idx 规则生成可视化用 final prediction。
         if final_score_map.dim() != 4:
             raise ValueError(
                 f"Expected final_score_map as [B, C, H, W], "
@@ -611,6 +628,7 @@ class VisualizationManager:
         model: torch.nn.Module,
         batch: Any,
     ) -> Optional[torch.Tensor]:
+        # 不走 final mixer，直接从 SAM3 segmentation_head 构造粗分割 logits。
         core = self._extract_core_model(model)
         if core is None:
             return None
@@ -660,6 +678,7 @@ class VisualizationManager:
         return direct_logits.detach()
 
     def should_save(self, stage: str) -> bool:
+        # 根据 enabled/save_stage 判断当前阶段是否需要保存可视化。
         if not self.cfg.enabled:
             return False
         if self.cfg.save_stage == "all":
@@ -668,6 +687,7 @@ class VisualizationManager:
 
     @staticmethod
     def _to_uint8_image(image: Any) -> Image.Image:
+        # 将 PIL/Tensor/ndarray 统一转成 RGB uint8 PIL 图像。
         if isinstance(image, Image.Image):
             return image.convert("RGB")
 
@@ -699,6 +719,7 @@ class VisualizationManager:
 
     @staticmethod
     def _extract_overlay_image(batch: Any, batch_index: int) -> Image.Image:
+        # overlay 优先使用未 Normalize 的 raw_image，缺失时退回 img_batch。
         raw_images = getattr(batch, "raw_images", None)
         if (
             raw_images is not None
@@ -710,6 +731,7 @@ class VisualizationManager:
 
     @staticmethod
     def _extract_original_reference_image(batch: Any, batch_index: int) -> Image.Image:
+        # original 优先使用原始尺寸图像，便于保存真实输入参考。
         raw_images_original = getattr(batch, "raw_images_original", None)
         if (
             raw_images_original is not None
@@ -742,6 +764,7 @@ class VisualizationManager:
         epoch: Optional[int],
         stage: str,
     ) -> Path:
+        # 每个样本单独保存到 stage/epoch/image_xxxxxx 目录下。
         parts = [self.save_dir, stage]
         if epoch is not None:
             parts.append(Path(f"epoch_{epoch:03d}"))
@@ -755,6 +778,7 @@ class VisualizationManager:
         label_map: torch.Tensor,
         out_hw: Tuple[int, int],
     ) -> torch.Tensor:
+        # 将 label/pred resize 到输出图像大小，使用 nearest 保持类别 id。
         x = label_map.detach().cpu()
         if x.dim() == 3:
             if x.shape[0] != 1:
@@ -798,6 +822,7 @@ class VisualizationManager:
 
     @staticmethod
     def _build_palette(num_classes: int) -> np.ndarray:
+        # 构造 PASCAL VOC 风格调色板，保证类别颜色稳定可复现。
         palette = np.zeros((num_classes, 3), dtype=np.uint8)
         for i in range(num_classes):
             lab = i
@@ -835,6 +860,7 @@ class VisualizationManager:
         label_map: torch.Tensor,
         num_classes: int,
     ) -> Image.Image:
+        # 将彩色 label map 按 alpha 混合到原图上。
         base = np.asarray(image.convert("RGB")).astype(np.float32)
         color = np.asarray(self._colorize_label_map(label_map, num_classes)).astype(np.float32)
 
@@ -870,6 +896,7 @@ class VisualizationManager:
         self,
         outputs: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        # 按优先级提取 final score/logits；缺失 score_map 时由 logits softmax 得到。
         final_score_map = self._get_output(outputs, OUTPUT_KEYS.final_score_map)
         final_logits = self._get_output(outputs, OUTPUT_KEYS.final_logits)
 
@@ -939,6 +966,7 @@ class VisualizationManager:
         self,
         outputs: Dict[str, torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[str]]:
+        # 提取 SAM3 粗 semantic 输出；若不存在则返回 None，由调用方决定是否跳过。
         semantic_score_map = self._get_output(outputs, OUTPUT_KEYS.semantic_score_map)
         semantic_logits = self._get_output(outputs, OUTPUT_KEYS.semantic_logits)
 

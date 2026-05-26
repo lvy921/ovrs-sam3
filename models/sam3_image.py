@@ -12,6 +12,8 @@ from .geometry_encoders import Prompt
 from .task_modes import OUTPUT_KEYS, TASK_MODE_SEMANTIC, normalize_task_mode
 from .vl_combiner import SAM3VLBackbone
 
+
+# SAM3 语义分割核心模型：负责 SAM3 粗分割、OpenCLIP 输入准备和 final mixer 调用。
 class Sam3Image(torch.nn.Module):
     def __init__(
         self,
@@ -56,6 +58,7 @@ class Sam3Image(torch.nn.Module):
     ):
         super().__init__()
 
+        # SAM3 原生组件：视觉/文本 backbone、prompt geometry encoder、transformer 和分割头。
         self.backbone = backbone
         self.geometry_encoder = input_geometry_encoder
         self.transformer = transformer
@@ -75,6 +78,7 @@ class Sam3Image(torch.nn.Module):
         self.clip_image_encoder = clip_image_encoder
         self.clip_text_encoder = clip_text_encoder
 
+        # OpenCLIP 图像归一化参数，register_buffer 保证随模型迁移设备但不作为可训练参数。
         self.register_buffer(
             "openclip_image_mean",
             torch.tensor([0.48145466, 0.4578275, 0.40821073], dtype=torch.float32).view(1, 3, 1, 1),
@@ -138,6 +142,7 @@ class Sam3Image(torch.nn.Module):
                 "OpenCLIP image/text encoders are required by the new final mixer."
             )
 
+        # final_mixer 接收 SAM3 粗 logits、class tokens、SAM3 pixel feature 和 CLIP 特征。
         self.final_mixer = ClassTokenSemanticFinalMixer(
             sam_dim=self.hidden_dim,
             clip_dim=self.clip_align_dim,
@@ -170,6 +175,7 @@ class Sam3Image(torch.nn.Module):
         return self._device
 
     def to(self, *args, **kwargs):
+        # 迁移设备后清空文本缓存，避免缓存 Tensor 留在旧设备。
         self._device = None
         self.clear_text_cache()
         return super().to(*args, **kwargs)
@@ -189,6 +195,7 @@ class Sam3Image(torch.nn.Module):
         device: Optional[torch.device] = None,
         force: bool = False,
     ) -> None:
+        # 对当前类别列表预计算 SAM3 文本特征和 CLIP prompt 文本特征。
         if len(class_texts) == 0:
             raise ValueError("class_texts is empty, cannot build text cache.")
 
@@ -233,6 +240,7 @@ class Sam3Image(torch.nn.Module):
         self.prepare_text_cache(class_texts=class_texts, device=device, force=False)
 
     def _slice_text_cache(self, start: int, end: int) -> Dict[str, torch.Tensor]:
+        # prompt chunking 时只取当前类别范围对应的文本缓存。
         if self._text_cache is None:
             raise RuntimeError("Text cache is not prepared.")
 
@@ -246,12 +254,14 @@ class Sam3Image(torch.nn.Module):
         return out
 
     def _get_prompt_chunk_size(self, num_classes: int) -> int:
+        # prompt_chunk_size=None 或 <=0 时一次处理全部类别。
         chunk_size = getattr(self, "prompt_chunk_size", None)
         if chunk_size is None or int(chunk_size) <= 0:
             return num_classes
         return min(int(chunk_size), num_classes)
 
     def _detach_tree(self, obj: Any):
+        # 递归 detach，避免缓存的 backbone/CLIP 特征保留计算图。
         if isinstance(obj, torch.Tensor):
             return obj.detach()
         if isinstance(obj, dict):
@@ -275,6 +285,7 @@ class Sam3Image(torch.nn.Module):
         raise AttributeError("clip_image_encoder must expose a positive integer `output_dim`.")
 
     def _get_openclip_patch_size(self) -> Tuple[int, int]:
+        # 从 OpenCLIP visual tower 中推断 patch size，用于图像 padding 对齐。
         visual = self.clip_image_encoder.visual
         patch_size = getattr(visual, "patch_size", None)
         if isinstance(patch_size, int):
@@ -302,6 +313,7 @@ class Sam3Image(torch.nn.Module):
         return x if pad_h == 0 and pad_w == 0 else F.pad(x, (0, pad_w, 0, pad_h), value=0.0)
 
     def _prepare_openclip_image_batch(self, raw_images: List[torch.Tensor], device: torch.device) -> torch.Tensor:
+        # 将原始 CHW 图像 pad 到 patch size 整数倍，并按 OpenCLIP 均值方差归一化。
         if len(raw_images) == 0:
             raise ValueError("raw_images is empty.")
 
@@ -326,6 +338,7 @@ class Sam3Image(torch.nn.Module):
         input: BatchedDatapoint,
         device: torch.device,
     ) -> Optional[Dict[str, torch.Tensor]]:
+        # 用 OpenCLIP 图像编码器提取 dense feature map，供 final mixer 使用。
         if self.clip_image_encoder is None:
             return None
         if input.raw_images is None:
@@ -351,6 +364,7 @@ class Sam3Image(torch.nn.Module):
         input: BatchedDatapoint,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+        # 准备 final mixer 需要的 CLIP 图像特征、CLIP 文本 token 和 CLIP 网格大小。
         class_texts = list(input.find_text_batch)
         if len(class_texts) == 0:
             raise ValueError("find_text_batch is empty.")
@@ -395,6 +409,7 @@ class Sam3Image(torch.nn.Module):
         self,
         backbone_out: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        # 使用 segmentation_head.pixel_decoder 从 SAM3 backbone FPN 构造高分辨率像素特征。
         if self.segmentation_head is None:
             raise RuntimeError(
                 "segmentation_head is None, cannot build SAM3 pixel feature."
@@ -448,6 +463,7 @@ class Sam3Image(torch.nn.Module):
         self,
         input: BatchedDatapoint,
     ) -> torch.Tensor:
+        # 从图像 batch 运行 SAM3 visual backbone，再构造 final mixer 所需像素特征。
         with torch.no_grad():
             image_backbone_out = self.backbone.forward_image(input.img_batch)
 
@@ -463,6 +479,7 @@ class Sam3Image(torch.nn.Module):
         sam3_text_mask: torch.Tensor,
         batch_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 将类别文本特征扩展到 B*C 对图像-类别 pair，适配 SAM3 grounding 路径。
         # sam3_text_feats: [M, C, D], sam3_text_mask: [C, M]
         seq_len, num_classes, dim = sam3_text_feats.shape
         feats = sam3_text_feats.permute(1, 0, 2).contiguous()
@@ -477,6 +494,7 @@ class Sam3Image(torch.nn.Module):
         self,
         input: BatchedDatapoint,
     ) -> Dict[str, Any]:
+        # 先运行 SAM3 粗分割路径，缓存 semantic_logits、class_tokens 和 pixel feature。
         device = self.device
 
         if len(input.find_inputs) != 1:
@@ -512,6 +530,7 @@ class Sam3Image(torch.nn.Module):
         merged_class_ids: list[int] = []
 
         for start in range(0, num_classes, chunk_size):
+            # 类别数较多时按 chunk 运行 SAM3 prompt/grounding，降低显存峰值。
             end = min(start + chunk_size, num_classes)
             chunk_texts = class_texts[start:end]
             num_chunk_classes = len(chunk_texts)
@@ -642,6 +661,7 @@ class Sam3Image(torch.nn.Module):
         device: torch.device,
         base_find_input: Optional[FindStage] = None,
     ) -> FindStage:
+        # 为每个图像-类别 pair 构造空几何 prompt，使语义类别可以走 grounding 接口。
         if self._has_nonempty_geometric_prompt(base_find_input):
             raise NotImplementedError(
                 "Current stage-1 internal chunking only supports semantic-only batches "
@@ -685,6 +705,7 @@ class Sam3Image(torch.nn.Module):
         batch_size: int,
         num_chunk_classes: int,
     ) -> Dict[str, torch.Tensor]:
+        # 将 chunk 内按 pair 展开的输出还原为 [B, C_chunk, ...]。
         out = {}
 
         for key in (
@@ -733,6 +754,7 @@ class Sam3Image(torch.nn.Module):
         batch: BatchedDatapoint,
         sam3_feature_high: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        # 准备 CLIP 输入并调用 final_mixer，输出 final logits、presence 和中间层结果。
         semantic_logits = self._ensure_4d_logits(
             semantic_logits,
             OUTPUT_KEYS.semantic_logits,
@@ -833,6 +855,7 @@ class Sam3Image(torch.nn.Module):
         final_mixer_cache: Dict[str, Any],
         batch: BatchedDatapoint,
     ) -> Dict[str, torch.Tensor]:
+        # 使用 build_final_mixer_cache 的结果运行 final mixer，避免重复 SAM3 粗分割。
         if batch is None:
             raise ValueError("batch must be provided for final mixer inputs.")
 
@@ -920,6 +943,7 @@ class Sam3Image(torch.nn.Module):
         visual_prompt_mask=None,
         encode_text=True,
     ):
+        # 将文本 prompt、几何 prompt 和可选视觉 prompt 拼接成 transformer encoder 的 prompt 输入。
         txt_feats = backbone_out["language_features"][:, find_input.text_ids]
         txt_masks = backbone_out["language_mask"][find_input.text_ids]
 
@@ -961,6 +985,7 @@ class Sam3Image(torch.nn.Module):
         prompt_mask,
         encoder_extra_kwargs: Optional[Dict] = None,
     ):
+        # 运行 SAM3 transformer encoder，把图像 token 与 prompt token 融合。
         feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
         backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
 
@@ -997,6 +1022,7 @@ class Sam3Image(torch.nn.Module):
         prompt,
         prompt_mask,
     ) -> Dict[str, torch.Tensor]:
+        # 用 segmentation_head 输出当前 chunk 的 SAM3 粗 semantic logits。
         if self.segmentation_head is None:
             raise ValueError("segmentation_head is None in semantic mode.")
 
@@ -1019,6 +1045,7 @@ class Sam3Image(torch.nn.Module):
         find_input,
         geometric_prompt: Prompt,
     ) -> Dict[str, torch.Tensor]:
+        # SAM3 原始 grounding/segmentation 路径；额外返回 final mixer 需要的 class_tokens。
         with torch.no_grad():
             with torch.profiler.record_function("Sam3Image._encode_prompt"):
                 prompt, prompt_mask, backbone_out = self._encode_prompt(
@@ -1053,6 +1080,7 @@ class Sam3Image(torch.nn.Module):
         return out
 
     def forward(self, input: BatchedDatapoint) -> Dict[str, torch.Tensor]:
+        # 默认前向：先构建 final mixer cache，再输出 final mixer 结果。
         final_mixer_cache = self.build_final_mixer_cache(input)
         return self.run_final_mixer_from_cache(
             final_mixer_cache=final_mixer_cache,

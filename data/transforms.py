@@ -12,6 +12,7 @@ from PIL import Image
 Sample = MutableMapping[str, Any]
 
 
+# 将 PIL/ndarray/Tensor 图像统一转换为 CHW float Tensor。
 def _to_tensor_image(image: Any) -> torch.Tensor:
     if isinstance(image, torch.Tensor):
         if image.ndim == 3:
@@ -34,6 +35,7 @@ def _to_tensor_image(image: Any) -> torch.Tensor:
     raise TypeError(f"Unsupported image type: {type(image)}")
 
 
+# 将 PIL/ndarray/Tensor 标签图统一转换为 Tensor，保持类别 id。
 def _to_tensor_mask(mask: Any) -> torch.Tensor:
     if mask is None:
         return None
@@ -46,6 +48,7 @@ def _to_tensor_mask(mask: Any) -> torch.Tensor:
     raise TypeError(f"Unsupported mask type: {type(mask)}")
 
 
+# 双线性 resize 图像 Tensor。
 def _resize_tensor_image(image: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
     if image.ndim != 3:
         raise ValueError(f"Unsupported image shape: {tuple(image.shape)}")
@@ -54,6 +57,7 @@ def _resize_tensor_image(image: torch.Tensor, size: Tuple[int, int]) -> torch.Te
     return out[0]
 
 
+# 最近邻 resize 标签图，避免类别 id 被插值成小数。
 def _resize_label_map(label_map: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
     if label_map is None:
         return None
@@ -64,6 +68,7 @@ def _resize_label_map(label_map: torch.Tensor, size: Tuple[int, int]) -> torch.T
     return label_map.long()
 
 
+# 计算保持长宽比时的目标尺寸。
 def _compute_keep_ratio_size(
     src_hw: Tuple[int, int],
     dst_hw: Tuple[int, int],
@@ -76,6 +81,7 @@ def _compute_keep_ratio_size(
     return out_h, out_w
 
 
+# 按最后两个维度裁剪，兼容 image [C,H,W] 和 label [H,W]。
 def _crop_last_two_dims(
     x: torch.Tensor,
     top: int,
@@ -86,6 +92,7 @@ def _crop_last_two_dims(
     return x[..., top:top + crop_h, left:left + crop_w]
 
 
+# 按最后两个维度 padding，兼容 image [C,H,W] 和 label [H,W]。
 def _pad_last_two_dims(
     x: torch.Tensor,
     out_h: int,
@@ -100,6 +107,7 @@ def _pad_last_two_dims(
     return F.pad(x, (0, pad_w, 0, pad_h), value=value)
 
 
+# 顺序执行多个 transform。
 class Compose:
     def __init__(self, transforms: Sequence):
         self.transforms = list(transforms)
@@ -110,6 +118,7 @@ class Compose:
         return sample
 
 
+# 将样本中的 image/raw_image/label_map 转成 Tensor。
 class ToTensor:
     def __call__(self, sample: Sample) -> Sample:
         sample = dict(sample)
@@ -125,6 +134,7 @@ class ToTensor:
         return sample
 
 
+# 转换图像 dtype，并可将 0-255 图像缩放到 0-1。
 class ConvertImageDtype:
     def __init__(self, dtype: torch.dtype | str = torch.float32, scale: bool = True):
         self.dtype = self._parse_dtype(dtype)
@@ -189,6 +199,7 @@ class ConvertImageDtype:
         return sample
 
 
+# 对训练图像做 mean/std 标准化；raw_image 保留给可视化和 OpenCLIP 使用。
 class Normalize:
     def __init__(self, mean: Sequence[float], std: Sequence[float]):
         self.mean = torch.tensor(mean).view(-1, 1, 1)
@@ -204,6 +215,7 @@ class Normalize:
         return sample
 
 
+# 固定尺寸 resize，可选择保持长宽比。
 class Resize:
     def __init__(self, size: Tuple[int, int], keep_ratio: bool = False):
         self.size = tuple(size)
@@ -232,6 +244,7 @@ class Resize:
         return sample
 
 
+# 将图像长边 resize 到指定长度，保持长宽比。
 class ResizeLongestSide:
     def __init__(self, long_side: int):
         self.long_side = int(long_side)
@@ -245,6 +258,7 @@ class ResizeLongestSide:
         return Resize((out_h, out_w))(sample)
 
 
+# 按随机比例缩放，常用于多尺度训练增强。
 class RandomResizeByRatio:
     def __init__(
         self,
@@ -266,6 +280,7 @@ class RandomResizeByRatio:
         return Resize((target_h, target_w), keep_ratio=self.keep_ratio)(sample)
 
 
+# 随机裁剪，并可限制 crop 内单一类别占比，避免训练样本过于单一。
 class RandomCrop:
     def __init__(
         self,
@@ -284,6 +299,7 @@ class RandomCrop:
         self.num_retry = int(num_retry)
 
     def _is_valid_crop(self, label_map) -> bool:
+        # cat_max_ratio 限制一个 crop 中最大类别占比。
         if label_map is None:
             return True
         if self.cat_max_ratio >= 1.0:
@@ -372,6 +388,7 @@ class RandomCrop:
         return sample
 
 
+# 随机垂直翻转图像和标签。
 class RandomVerticalFlip:
     def __init__(self, prob: float = 0.5):
         self.prob = float(prob)
@@ -392,6 +409,7 @@ class RandomVerticalFlip:
         return sample
 
 
+# 随机旋转 90/180/270 度，适合方向不固定的遥感俯视图。
 class RandomRotate90:
     def __init__(self, prob: float = 0.5):
         self.prob = float(prob)
@@ -414,6 +432,7 @@ class RandomRotate90:
         return sample
 
 
+# 从候选尺寸中随机选择一个 resize 尺寸。
 class RandomResize:
     def __init__(self, scales: Sequence[Tuple[int, int]]):
         self.scales = list(scales)
@@ -423,6 +442,7 @@ class RandomResize:
         return Resize(size)(sample)
 
 
+# 随机水平翻转图像和标签。
 class RandomHorizontalFlip:
     def __init__(self, prob: float = 0.5):
         self.prob = float(prob)
@@ -443,6 +463,7 @@ class RandomHorizontalFlip:
         return sample
 
 
+# 将图像和标签 pad 到固定尺寸。
 class PadToSize:
     def __init__(
         self,

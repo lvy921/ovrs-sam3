@@ -13,6 +13,8 @@ from .final_mixer_clip_sam import (
     ClipCoarseMaskEmbedder,
 )
 
+
+# 构建并更新每个类别的 class tokens，是 final mixer 的类别语义表示入口。
 class ClassTokenBuilder(nn.Module):
     """
     Build per-class trainable class tokens for the final mixer.
@@ -113,6 +115,7 @@ class ClassTokenBuilder(nn.Module):
         sam3_pair_feats: torch.Tensor,
         sam3_pair_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # 用可学习 query 关注 SAM3 文本 token，得到每个类别的 class token seed。
         if sam3_pair_feats.dim() != 3:
             raise ValueError(
                 "sam3_pair_feats must be [B*C_chunk, M, D], "
@@ -192,6 +195,7 @@ class ClassTokenBuilder(nn.Module):
         class_token_seed: torch.Tensor,
         encoder_out: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        # class token seed 再关注图像 encoder memory，注入图像上下文。
         if class_token_seed.dim() != 3:
             raise ValueError(
                 "class_token_seed must be [B*C_chunk, Q, D], "
@@ -225,6 +229,8 @@ class ClassTokenBuilder(nn.Module):
         class_tokens = self.encoder_cross_attn_norm(class_token_seed + attn_out)
         return class_tokens.contiguous()
 
+
+# final mixer 的单层融合块：更新 class tokens、presence 和 mask embedding。
 class MaskEmbeddingFusionLayer(nn.Module):
     """
     One layer of mask-embedding fusion.
@@ -371,6 +377,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
         self,
         class_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # 同一 token 槽位上，让不同类别之间做 self-attention。
         batch_size, num_classes, num_tokens, dim = class_tokens.shape
 
         x = class_tokens.permute(0, 2, 1, 3).contiguous()
@@ -391,6 +398,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
         self,
         class_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # 同一类别内部，让多个 class token 之间交换信息。
         batch_size, num_classes, num_tokens, dim = class_tokens.shape
 
         x = class_tokens.reshape(batch_size * num_classes, num_tokens, dim)
@@ -409,6 +417,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
         self,
         feature_map: torch.Tensor,
     ) -> torch.Tensor:
+        # class token 关注空间特征前先下采样，降低 attention 计算量。
         if feature_map.dim() != 4:
             raise ValueError(
                 "feature_map must be [B, D, H, W], "
@@ -432,6 +441,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
         class_tokens: torch.Tensor,
         feature_map: torch.Tensor,
     ) -> torch.Tensor:
+        # 每个类别的 class tokens 作为 query，关注池化后的空间特征。
         if class_tokens.dim() != 4:
             raise ValueError(
                 "class_tokens must be [B, C, Q, D], "
@@ -484,6 +494,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
         self,
         class_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # 将每个类别的 class tokens 汇总成 presence logits，判断类别是否存在。
         if class_tokens.dim() != 4:
             raise ValueError(
                 "class_tokens must be [B, C, Q, D], "
@@ -541,6 +552,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
         presence_logits: torch.Tensor,
         class_code: torch.Tensor,
     ) -> torch.Tensor:
+        # 用 presence 调整 SAM3 粗语义 logits，再与 class_code 融合成 prior embedding。
         if semantic_logits.dim() != 4:
             raise ValueError(
                 "semantic_logits must be [B, C, H, W], "
@@ -619,6 +631,7 @@ class MaskEmbeddingFusionLayer(nn.Module):
         mask_embed: torch.Tensor,
         class_code: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 一层中依次更新 class tokens、mask embedding，并输出该层 presence logits。
         if class_tokens.dim() != 4:
             raise ValueError(
                 "class_tokens must be [B, C, Q, D], "
@@ -739,6 +752,8 @@ class MaskEmbeddingFusionLayer(nn.Module):
         )
 
 
+
+# 多层 final mixer：融合 SAM3 粗分割、SAM3 像素特征与 OpenCLIP 图文特征。
 class ClassTokenSemanticFinalMixer(nn.Module):
     """
     Final mixer for open-vocabulary semantic segmentation.
@@ -946,6 +961,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         self,
         class_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # 对每类的 Q 个 class token 求平均，得到后续点积用的 class_code。
         if class_tokens.dim() != 4:
             raise ValueError(
                 "class_tokens must be [B, C, Q, D], "
@@ -967,6 +983,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         semantic_logits: torch.Tensor,
         class_code: torch.Tensor,
     ) -> torch.Tensor:
+        # 用 SAM3 粗语义概率加权 class_code，构造初始 mask embedding。
         if semantic_logits.dim() != 4:
             raise ValueError(
                 "semantic_logits must be [B, C, H, W], "
@@ -1001,6 +1018,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         mask_embed: torch.Tensor,
         class_code: torch.Tensor,
     ) -> torch.Tensor:
+        # 每个像素的 mask_embed 与每个类别的 class_code 点积，得到 mask logits。
         if mask_embed.dim() != 4:
             raise ValueError(
                 "mask_embed must be [B, D, H, W], "
@@ -1050,6 +1068,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         sam3_feature_high: torch.Tensor,
         clip_grid_hw: tuple[int, int],
     ) -> None:
+        # 对 final mixer 的关键输入做形状一致性检查，尽早暴露配置/模型错误。
         if semantic_logits.dim() != 4:
             raise ValueError(
                 "semantic_logits must be [B, C, H, W], "
@@ -1140,6 +1159,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         sam3_feature_high: torch.Tensor,
         clip_grid_hw: tuple[int, int],
     ) -> Dict[str, torch.Tensor]:
+        # 主流程：构建 CLIP-SAM 特征、逐层融合、输出最终 logits 与中间层结果。
         self._validate_inputs(
             semantic_logits=semantic_logits,
             class_tokens=class_tokens,

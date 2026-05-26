@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# 二维 shifted-window cross-attention：在局部窗口内做注意力，并可通过窗口平移交换跨窗口信息。
 class ShiftedWindowAttention2D(nn.Module):
     """
     2D shifted-window cross-attention.
@@ -34,6 +35,7 @@ class ShiftedWindowAttention2D(nn.Module):
     ) -> None:
         super().__init__()
 
+        # value_preserving=True 时不投影 value/out，更偏向保留输入 value 的特征空间。
         self.hidden_dim = int(hidden_dim)
         self.num_heads = int(num_heads)
         self.window_size = int(window_size)
@@ -88,6 +90,7 @@ class ShiftedWindowAttention2D(nn.Module):
         )
 
         if self.use_rel_pos_bias:
+            # 相对位置偏置表覆盖窗口内任意两个 token 的相对位移。
             num_rel_pos = (2 * self.window_size - 1) * (2 * self.window_size - 1)
             self.relative_position_bias_table = nn.Parameter(
                 torch.zeros(num_rel_pos, self.num_heads)
@@ -126,6 +129,7 @@ class ShiftedWindowAttention2D(nn.Module):
         x: torch.Tensor,
         window_size: int,
     ) -> tuple[torch.Tensor, int, int]:
+        # 将 H/W 补齐到 window_size 的整数倍，保证后续可以整齐切窗。
         height, width = int(x.shape[-2]), int(x.shape[-1])
         pad_h = (window_size - height % window_size) % window_size
         pad_w = (window_size - width % window_size) % window_size
@@ -137,6 +141,7 @@ class ShiftedWindowAttention2D(nn.Module):
         return x, height, width
 
     def _map_to_windows(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, D, H, W] -> [B*num_windows, window*window, D]。
         batch_size, dim, height, width = x.shape
         window = self.window_size
 
@@ -160,6 +165,7 @@ class ShiftedWindowAttention2D(nn.Module):
         original_h: int,
         original_w: int,
     ) -> torch.Tensor:
+        # 将窗口 token 还原成二维特征图，并裁掉 padding 区域。
         window = self.window_size
         dim = self.hidden_dim
 
@@ -182,6 +188,7 @@ class ShiftedWindowAttention2D(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
+        # shifted window 需要 attention mask，避免平移后不同原始区域错误互相注意。
         if self.shift_size <= 0:
             return None
 
@@ -218,6 +225,7 @@ class ShiftedWindowAttention2D(nn.Module):
         return attn_mask
 
     def _add_relative_position_bias(self, attn: torch.Tensor) -> torch.Tensor:
+        # 将每个 head 的相对位置偏置加到 attention logits 上。
         if not self.use_rel_pos_bias:
             return attn
 
@@ -235,6 +243,7 @@ class ShiftedWindowAttention2D(nn.Module):
         key_map: torch.Tensor,
         value_map: torch.Tensor,
     ) -> torch.Tensor:
+        # 输入/输出保持二维特征图格式；内部切成窗口序列执行 Multi-Head Attention。
         if query_map.dim() != 4:
             raise ValueError(
                 f"query_map must be [B, D, H, W], got {tuple(query_map.shape)}."
@@ -263,6 +272,7 @@ class ShiftedWindowAttention2D(nn.Module):
         padded_h, padded_w = int(query_map.shape[-2]), int(query_map.shape[-1])
 
         if self.shift_size > 0:
+            # 先循环平移特征图，再按窗口切分，实现 shifted-window attention。
             shifts = (-self.shift_size, -self.shift_size)
             query_map = torch.roll(query_map, shifts=shifts, dims=(-2, -1))
             key_map = torch.roll(key_map, shifts=shifts, dims=(-2, -1))
@@ -312,6 +322,7 @@ class ShiftedWindowAttention2D(nn.Module):
             dtype=attn.dtype,
         )
         if attn_mask is not None:
+            # mask 在窗口维度上广播到 batch 和 head，屏蔽跨窗口非法注意力。
             num_windows_per_image = int(attn_mask.shape[0])
             attn = attn.reshape(
                 batch_size,
@@ -356,6 +367,7 @@ class ShiftedWindowAttention2D(nn.Module):
         )
 
         if self.shift_size > 0:
+            # 将 shifted-window 输出平移回原始坐标系。
             out_map = torch.roll(
                 out_map,
                 shifts=(self.shift_size, self.shift_size),

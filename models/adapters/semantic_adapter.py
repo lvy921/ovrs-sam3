@@ -10,6 +10,7 @@ from ..data_misc import BatchedDatapoint
 from ..task_modes import OUTPUT_KEYS
 
 
+# 将模型原始输出统一整理成语义分割训练/验证需要的标准字段。
 class SemanticSegAdapter(nn.Module):
     def __init__(self):
         super().__init__()
@@ -19,6 +20,7 @@ class SemanticSegAdapter(nn.Module):
         raw_outputs: Dict[str, torch.Tensor],
         key: str,
     ) -> torch.Tensor:
+        # 强制检查关键输出，避免后续 loss/evaluator 用到缺失字段时才报错。
         value = raw_outputs.get(key, None)
         if value is None:
             raise ValueError(f"Raw outputs must contain '{key}'.")
@@ -29,6 +31,7 @@ class SemanticSegAdapter(nn.Module):
         x: torch.Tensor,
         key: str,
     ) -> torch.Tensor:
+        # 统一 logits 形状到 [B, C, H, W]；兼容 [B, C, 1, H, W]。
         if x.dim() == 5:
             if x.shape[2] != 1:
                 raise ValueError(
@@ -49,6 +52,7 @@ class SemanticSegAdapter(nn.Module):
         batch: BatchedDatapoint,
         expected_num_classes: Optional[int],
     ) -> Optional[int]:
+        # 优先使用显式类别数；否则从 batch.find_metadatas 推断类别数量。
         if expected_num_classes is not None:
             return int(expected_num_classes)
 
@@ -65,6 +69,7 @@ class SemanticSegAdapter(nn.Module):
         actual_num_classes: int,
         expected_num_classes: Optional[int],
     ) -> None:
+        # 检查输出类别通道数是否与 dataloader 提供的类别数量一致。
         if expected_num_classes is None:
             return
 
@@ -81,6 +86,7 @@ class SemanticSegAdapter(nn.Module):
         lhs_key: str,
         rhs_key: str,
     ) -> None:
+        # semantic_logits 和 final_logits 必须有相同的 batch/class/space 形状。
         if tuple(lhs.shape) != tuple(rhs.shape):
             raise ValueError(
                 f"Shape mismatch between {lhs_key} and {rhs_key}: "
@@ -94,6 +100,7 @@ class SemanticSegAdapter(nn.Module):
         expected_num_classes: Optional[int] = None,
         output_mode: str = "final",
     ) -> Dict[str, torch.Tensor]:
+        # 当前语义训练路径要求同时存在 SAM3 粗输出和 final mixer 输出。
         output_mode = str(output_mode).lower()
         if output_mode not in {"final", "infer"}:
             raise ValueError(
@@ -128,6 +135,7 @@ class SemanticSegAdapter(nn.Module):
 
         outputs = dict(raw_outputs)
 
+        # 写回规范化后的 logits，并补充 softmax score map 与最终类别图。
         outputs[OUTPUT_KEYS.semantic_logits] = semantic_logits
         outputs[OUTPUT_KEYS.final_logits] = final_logits
 
@@ -146,6 +154,7 @@ class SemanticSegAdapter(nn.Module):
         return outputs
 
 
+# 混合任务 adapter 目前是占位实现。
 class HybridSegAdapter(nn.Module):
     def __init__(self):
         super().__init__()

@@ -11,10 +11,12 @@ from torch.utils.data import Dataset
 from . import transforms as T
 
 
+# 读取 RGB 图像。
 def _load_image(path: Path) -> Image.Image:
     return Image.open(path).convert("RGB")
 
 
+# 读取语义标签图；如果是 RGB/彩色标签，只取第一个通道作为类别 id。
 def _load_label_map(path: Path) -> torch.Tensor:
     arr = np.array(Image.open(path))
     if arr.ndim == 3:
@@ -22,12 +24,14 @@ def _load_label_map(path: Path) -> torch.Tensor:
     return torch.from_numpy(arr).long()
 
 
+# 从配置递归构建 transform；支持单个 dict、list 和已构造的 callable。
 def _build_transform_from_cfg(cfg: Any) -> Optional[Callable]:
     if cfg is None:
         return None
     if callable(cfg):
         return cfg
     if isinstance(cfg, list):
+        # list 配置会被包装成 Compose，按顺序执行每个 transform。
         transforms = [_build_transform_from_cfg(x) for x in cfg]
         transforms = [x for x in transforms if x is not None]
         return T.Compose(transforms)
@@ -48,6 +52,7 @@ def _build_transform_from_cfg(cfg: Any) -> Optional[Callable]:
     return cls(**cfg)
 
 
+# 开放词汇语义分割数据集，返回图像、标签图和类别文本列表。
 class OVSemanticSegDataset(Dataset):
     def __init__(
         self,
@@ -72,6 +77,7 @@ class OVSemanticSegDataset(Dataset):
         self.return_raw_image = bool(return_raw_image)
         self.transforms = _build_transform_from_cfg(transforms)
 
+        # 初始化时检查数据目录和标注文件完整性，避免训练中途才失败。
         if not self.img_dir.exists():
             raise FileNotFoundError(f"img_dir not found: {self.img_dir}")
         if not self.ann_dir.exists():
@@ -91,6 +97,7 @@ class OVSemanticSegDataset(Dataset):
         return len(self.img_paths)
 
     def _process_label_map(self, label_map: torch.Tensor) -> torch.Tensor:
+        # reduce_zero_label=True 时，将原背景 0 变为 ignore，其余类别整体减 1。
         label_map = label_map.long()
 
         if self.reduce_zero_label:
@@ -104,6 +111,7 @@ class OVSemanticSegDataset(Dataset):
         return label_map
 
     def __getitem__(self, index: int):
+        # 单样本输出是普通 dict，后续由 transforms 和 collator 转成 BatchedDatapoint。
         img_path = self.img_paths[index]
         seg_path = self.seg_paths[index]
 

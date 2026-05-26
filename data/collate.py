@@ -16,6 +16,7 @@ from ..models.data_misc import (
 Sample = MutableMapping[str, Any]
 
 
+# 将单个 Tensor 的 H/W pad 到 batch 内统一尺寸。
 def _pad_tensor_hw(
     x: torch.Tensor,
     out_h: int,
@@ -30,10 +31,12 @@ def _pad_tensor_hw(
     return F.pad(x, (0, pad_w, 0, pad_h), value=value)
 
 
+# 向上取整到 divisor 的倍数，用于适配 ViT patch/grid 约束。
 def _round_up(value: int, divisor: int) -> int:
     return int(math.ceil(value / divisor) * divisor)
 
 
+# 将 Dataset 返回的样本列表整理成 SAM3 需要的 BatchedDatapoint。
 class OVSemanticCollator:
     def __init__(
         self,
@@ -46,6 +49,7 @@ class OVSemanticCollator:
         self.label_pad_value = int(label_pad_value)
 
     def _collate_images(self, samples: Sequence[Sample]):
+        # 找到 batch 最大 H/W，并可进一步 pad 到 pad_size_divisor 的倍数。
         sizes = [(int(s["image"].shape[-2]), int(s["image"].shape[-1])) for s in samples]
         max_h = max(h for h, _ in sizes)
         max_w = max(w for _, w in sizes)
@@ -65,11 +69,13 @@ class OVSemanticCollator:
         samples: Sequence[Sample],
         key: str,
     ) -> list[Any] | None:
+        # raw_image / raw_image_original 是可选可视化输入，不存在时返回 None。
         if not any(key in s and s[key] is not None for s in samples):
             return None
         return [s.get(key, None) for s in samples]
 
     def __call__(self, samples: Sequence[Sample]) -> BatchedDatapoint:
+        # 组装图像 batch、标签图、类别文本、元信息和空几何 prompt。
         samples = list(samples)
         if len(samples) == 0:
             raise ValueError("Empty batch.")
@@ -89,6 +95,7 @@ class OVSemanticCollator:
             if shared_class_texts is None:
                 shared_class_texts = texts
             else:
+                # 同一个 batch 内必须共享类别顺序，否则输出通道无法对齐类别文本。
                 if texts != shared_class_texts:
                     raise ValueError(
                         "All samples in one batch must share the same class_texts order. "
@@ -113,6 +120,7 @@ class OVSemanticCollator:
             raise ValueError("shared_class_texts is None.")
 
         find_stage = FindStage(
+            # 语义分割训练不使用 box/point prompt，这里构造空 prompt 占位。
             img_ids=None,
             text_ids=None,
             input_boxes=torch.zeros((0, 0, 4), dtype=torch.float32),

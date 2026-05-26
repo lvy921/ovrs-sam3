@@ -69,6 +69,7 @@ ConfigT = TypeVar("ConfigT")
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
+# 解析 SAM3 文本编码器使用的 BPE 词表路径；优先使用配置显式传入的路径。
 def resolve_bpe_path(explicit_bpe_path=None):
     if explicit_bpe_path is not None:
         p = Path(explicit_bpe_path).expanduser().resolve()
@@ -95,6 +96,7 @@ def resolve_bpe_path(explicit_bpe_path=None):
     )
 
 
+# 在 Ampere 及更新架构的 NVIDIA GPU 上启用 TF32，提高 matmul/cudnn 性能。
 def _setup_tf32() -> None:
     if torch.cuda.is_available():
         device_props = torch.cuda.get_device_properties(0)
@@ -106,6 +108,7 @@ def _setup_tf32() -> None:
 _setup_tf32()
 
 
+# 提供冻结/解冻模块参数的通用工具函数，供 SAM3ModelBuilder 复用。
 class FrozenModuleMixin:
     @staticmethod
     def set_requires_grad(module: Optional[nn.Module], requires_grad: bool) -> None:
@@ -160,9 +163,11 @@ class FrozenModuleMixin:
                 )
 
 
+# 集中负责把配置转换为模型、损失函数、Trainer 运行组件。
 class SAM3ModelBuilder(FrozenModuleMixin):
     @staticmethod
     def _coerce_config(obj, config_cls: type[ConfigT], name: str) -> ConfigT:
+        # 将 dict / None / dataclass 实例统一转换成指定的配置 dataclass。
         if isinstance(obj, config_cls):
             return obj
         if obj is None:
@@ -228,6 +233,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
             cfg = obj
         elif isinstance(obj, dict):
             raw = dict(obj)
+            # final_mixer_cfg 内部还有多层嵌套配置，需要逐个转成 dataclass。
             nested_coercers = {
                 "clip_sam_feature_cfg": cls._coerce_clip_sam_feature_cfg,
                 "clip_sam_upsample_cfg": cls._coerce_clip_sam_upsample_cfg,
@@ -269,6 +275,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def _normalize_build_cfg(cls, cfg: SegmentorBuildConfig) -> SegmentorBuildConfig:
+        # 标准化任务模式，并把所有嵌套 dict 配置转成对应 dataclass。
         cfg.task_mode = normalize_task_mode(cfg.task_mode)
         cfg.freeze_cfg = cls._coerce_freeze_cfg(cfg.freeze_cfg)
         cfg.openclip_cfg = cls._coerce_openclip_cfg(cfg.openclip_cfg)
@@ -279,6 +286,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_config(cls, **kwargs) -> SegmentorBuildConfig:
+        # 从 cfg.model 的关键字参数构建完整模型配置，并做校验。
         cfg = SegmentorBuildConfig(**kwargs)
         cfg = cls._normalize_build_cfg(cfg)
         cfg.openclip_cfg = cls.validate_openclip_cfg(cfg.openclip_cfg)
@@ -293,6 +301,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @staticmethod
     def resolve_work_dir(cfg, work_dir_override: Optional[str] = None) -> str:
+        # 命令行 --work-dir 优先级高于配置文件中的 work_dir。
         if work_dir_override is not None:
             return str(work_dir_override)
         return str(cfg.get("work_dir", "./work_dirs/default"))
@@ -314,6 +323,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
     def validate_openclip_cfg(cls, openclip_cfg: OpenCLIPConfig) -> OpenCLIPConfig:
         openclip_cfg = cls._coerce_openclip_cfg(openclip_cfg)
 
+        # 未启用 OpenCLIP 时不要求 pretrained 等字段。
         if not openclip_cfg.enabled:
             return openclip_cfg
 
@@ -336,6 +346,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
     def validate_final_mixer_cfg(cls, cfg: FinalMixerConfig) -> FinalMixerConfig:
         cfg = cls._coerce_final_mixer_cfg(cfg)
 
+        # 当前语义训练路径依赖 final mixer，因此这里直接禁止关闭。
         if not cfg.enabled:
             raise ValueError(
                 "final_mixer_cfg.enabled=False is not supported by the current "
@@ -431,6 +442,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @staticmethod
     def _create_vit_backbone(compile_mode=None):
+        # 构建 SAM3 的 ViT 图像主干；compile_mode 控制是否 torch.compile。
         return ViT(
             img_size=1008,
             pretrain_img_size=336,
@@ -460,6 +472,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def _create_vit_neck(cls, position_encoding, vit_backbone):
+        # 将 ViT 主干输出包装成 SAM3 使用的多尺度视觉 neck。
         return Sam3DualViTDetNeck(
             position_encoding=position_encoding,
             d_model=256,
@@ -470,6 +483,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @staticmethod
     def _create_text_encoder(bpe_path: str) -> VETextEncoder:
+        # 构建 SAM3 自带的文本编码器，用于类别文本和 prompt 编码。
         tokenizer = SimpleTokenizer(bpe_path=bpe_path)
         return VETextEncoder(
             tokenizer=tokenizer,
@@ -601,6 +615,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
     ) -> tuple[OpenCLIPTextEncoder, OpenCLIPImageEncoder]:
         import open_clip
 
+        # 使用 open_clip 库加载 RemoteCLIP/OpenCLIP 权重与 tokenizer。
         pretrained = cls._resolve_openclip_pretrained(openclip_cfg.pretrained)
         if pretrained is None:
             raise ValueError(
@@ -646,6 +661,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @staticmethod
     def _load_checkpoint(model, checkpoint_path: str):
+        # 加载 SAM3 checkpoint；兼容原始 checkpoint 中 detector. 前缀。
         with g_pathmgr.open(checkpoint_path, "rb") as f:
             ckpt = torch.load(f, map_location="cpu", weights_only=True)
 
@@ -674,6 +690,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def apply_freeze_cfg(cls, model: nn.Module, freeze_cfg: FreezeConfig) -> None:
+        # 白名单模式：先冻结全部参数，再只解冻 trainable_modules。
         if freeze_cfg.train_adapters_only:
             cls.set_model_requires_grad(model, False)
             cls.set_modules_requires_grad(
@@ -683,6 +700,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
                 strict=True,
             )
         else:
+            # 黑名单模式：先允许全模型训练，再冻结 frozen_modules。
             cls.set_model_requires_grad(model, True)
             cls.set_modules_requires_grad(
                 model,
@@ -693,6 +711,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_semantic_core_model(cls, cfg: SegmentorBuildConfig) -> nn.Module:
+        # 先构建 SAM3 主干，再按配置接入 OpenCLIP 与 final mixer。
         bpe_path = resolve_bpe_path(cfg.bpe_path)
         compile_mode = "default" if cfg.compile else None
 
@@ -761,6 +780,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
             task_mode=TASK_MODE_SEMANTIC,
         )
 
+        # checkpoint_path 优先；如果未提供且允许 HF，则下载 facebook/sam3 权重。
         checkpoint_path = cfg.checkpoint_path
         if cfg.load_from_hf and checkpoint_path is None:
             checkpoint_path = cls.download_ckpt_from_hf()
@@ -792,6 +812,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
 
     @classmethod
     def build_semantic_segmentor(cls, cfg: SegmentorBuildConfig) -> nn.Module:
+        # SAM3Segmentor 将核心网络 core 和输出 adapter 组合成训练入口模型。
         core_model = cls.build_semantic_core_model(cfg)
         adapter = cls.build_adapter(cfg)
 
@@ -848,6 +869,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         work_dir: str,
         auto_resume: bool = False,
     ) -> TrainerConfig:
+        # 将顶层 train_cfg 合并 work_dir / tta_cfg / eval_cfg，形成 TrainerConfig。
         train_cfg = cls._require_dict(cfg.train_cfg, "train_cfg")
         train_cfg["save_dir"] = str(work_dir)
         train_cfg["auto_resume"] = bool(
@@ -918,6 +940,7 @@ class SAM3ModelBuilder(FrozenModuleMixin):
         Optional[VisualizationManager],
         CheckpointManager,
     ]:
+        # 构建训练循环外壳所需组件：目录、Trainer 配置、hooks、可视化和 checkpoint。
         work_dir = cls.resolve_work_dir(
             cfg,
             work_dir_override=work_dir_override,

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from .shifted_window_attention import ShiftedWindowAttention2D
 
 
+# 负责把 OpenCLIP 图像特征、OpenCLIP 文本特征和 SAM3 class tokens 对齐到同一空间。
 class ClipSamFeatureInitializer(nn.Module):
     """
     Build low-resolution aligned CLIP-SAM feature inside the final mixer.
@@ -88,6 +89,7 @@ class ClipSamFeatureInitializer(nn.Module):
         clip_text_tokens_native: torch.Tensor,
         class_token_query_embed: torch.Tensor,
     ) -> torch.Tensor:
+        # 用 class-token query 去关注每类的多个 CLIP prompt 文本特征，得到 CLIP 空间 key。
         if clip_text_tokens_native.dim() != 3:
             raise ValueError(
                 "clip_text_tokens_native must be [C, K, D_clip], "
@@ -180,6 +182,7 @@ class ClipSamFeatureInitializer(nn.Module):
         clip_keys: torch.Tensor,
         class_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # CLIP 图像 token 作为 query，CLIP 文本 key 作为 key，SAM class token 作为 value。
         if image_tokens.dim() != 3:
             raise ValueError(
                 "image_tokens must be [B, N, D_clip], "
@@ -273,6 +276,7 @@ class ClipSamFeatureInitializer(nn.Module):
         class_token_query_embed: torch.Tensor,
         class_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # 输出低分辨率 aligned_clip_sam_feature_low: [B, Hc*Wc, D_sam]。
         if clip_image_feat_map_native.dim() != 4:
             raise ValueError(
                 "clip_image_feat_map_native must be [B, D_clip, Hc, Wc], "
@@ -324,6 +328,7 @@ class ClipSamFeatureInitializer(nn.Module):
         return aligned.contiguous()
 
 
+# 将低分辨率 CLIP-SAM 对齐特征上采样到 SAM3 mask 分辨率。
 class CrossGuidedClipSamUpsampler(nn.Module):
     """
     Upsample aligned low-resolution CLIP-SAM feature with SAM3 high-res feature.
@@ -407,6 +412,7 @@ class CrossGuidedClipSamUpsampler(nn.Module):
 
     @staticmethod
     def _map_layer_norm(norm: nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
+        # 对 [B, D, H, W] 的每个空间位置做 LayerNorm。
         batch_size, dim, height, width = x.shape
         x_tokens = x.flatten(2).transpose(1, 2).contiguous()
         x_tokens = norm(x_tokens)
@@ -423,6 +429,7 @@ class CrossGuidedClipSamUpsampler(nn.Module):
         sam3_feature_high: torch.Tensor,
         clip_grid_hw: tuple[int, int],
     ) -> torch.Tensor:
+        # 先插值到高分辨率，再用 SAM3 高分辨率特征引导窗口注意力细化。
         if aligned_clip_sam_feature_low.dim() != 3:
             raise ValueError(
                 "aligned_clip_sam_feature_low must be [B, Hc*Wc, D], "
@@ -493,6 +500,7 @@ class CrossGuidedClipSamUpsampler(nn.Module):
         return clip_sam_feature.flatten(2).transpose(1, 2).contiguous()
 
 
+# 构造一份 CLIP 粗分割结果，并把粗类别嵌入加回 CLIP-SAM 特征。
 class ClipCoarseMaskEmbedder(nn.Module):
     """
     Build coarse CLIP segmentation embedding and add it to CLIP-SAM feature.
@@ -544,6 +552,7 @@ class ClipCoarseMaskEmbedder(nn.Module):
         clip_text_tokens_native: torch.Tensor,
         output_hw: tuple[int, int],
     ) -> torch.Tensor:
+        # 将 CLIP 图像特征上采样后，与每类 CLIP 文本原型做相似度得到 coarse logits。
         if clip_image_feat_map_native.dim() != 4:
             raise ValueError(
                 "clip_image_feat_map_native must be [B, D_clip, Hc, Wc], "
@@ -609,6 +618,7 @@ class ClipCoarseMaskEmbedder(nn.Module):
         coarse_pred: torch.Tensor,
         class_code: torch.Tensor,
     ) -> torch.Tensor:
+        # 将 coarse_pred 中的类别 id 替换成对应 class_code，得到空间嵌入图。
         if coarse_pred.dim() != 3:
             raise ValueError(
                 "coarse_pred must be [B, H, W], "
@@ -657,6 +667,7 @@ class ClipCoarseMaskEmbedder(nn.Module):
         clip_sam_feature_high: torch.Tensor,
         output_hw: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 返回增强后的 CLIP-SAM 特征、CLIP coarse logits 和 coarse argmax 预测。
         if clip_sam_feature_high.dim() != 3:
             raise ValueError(
                 "clip_sam_feature_high must be [B, H*W, D_sam], "

@@ -21,6 +21,8 @@ from .evaluator import (
 from .hooks import Hook, HookManager
 from .visualization import VisualizationManager
 
+
+# Trainer 负责训练循环、验证循环、日志状态、checkpoint 和 hook 调度。
 class Trainer:
     def __init__(
         self,
@@ -35,6 +37,7 @@ class Trainer:
         hooks: Optional[Sequence[Hook]] = None,
         visualizer: Optional[VisualizationManager] = None,
     ):
+        # 保存外部构建好的核心组件，Trainer 只负责调度它们。
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
@@ -44,6 +47,7 @@ class Trainer:
         self.cfg = cfg or TrainerConfig()
 
         self.device = torch.device(self.cfg.device)
+        # AMP 梯度缩放器；仅在 CUDA 且 use_amp=True 时启用。
         self.scaler = GradScaler(
             device="cuda",
             enabled=self.cfg.use_amp and self.device.type == "cuda",
@@ -59,6 +63,7 @@ class Trainer:
 
         self.global_iter = 0
 
+        # dataloader 长度用于估计数据轮次和 resume 后跳到正确位置。
         self.iters_per_cycle = None
         if self.train_dataloader is not None and hasattr(self.train_dataloader, "__len__"):
             self.iters_per_cycle = len(self.train_dataloader)
@@ -68,8 +73,10 @@ class Trainer:
             self.val_iters_per_epoch = len(self.val_dataloader)
 
         self.log_state: Dict[str, object] = {}
+        # 外部可注册额外日志 getter，例如记录模型内部可学习参数。
         self._log_getters = []
 
+        # 最近若干次训练/验证状态的滑动窗口，用于日志平滑。
         self._iter_time_history = deque(maxlen=self.cfg.log_window_size)
         self._data_time_history = deque(maxlen=self.cfg.log_window_size)
         self._train_stat_history = deque(maxlen=self.cfg.log_window_size)
@@ -82,6 +89,7 @@ class Trainer:
         self._data_cycle = 0
 
     def maybe_resume_latest(self):
+        # auto_resume=True 时尝试从 checkpoint_manager 找最新 checkpoint。
         if not self.cfg.auto_resume:
             return None
 
@@ -98,6 +106,7 @@ class Trainer:
         return ckpt
 
     def resume_from(self, path: str):
+        # 从指定 checkpoint 恢复模型、优化器、scaler、scheduler 和 global_iter。
         ckpt = self.checkpoint_manager.load(
             path,
             model=self.model,
@@ -111,6 +120,7 @@ class Trainer:
         return ckpt
 
     def _move_to_device(self, obj):
+        # 递归移动 batch 中的 Tensor / dataclass / dict / list / tuple 到训练设备。
         if isinstance(obj, torch.Tensor):
             return obj.to(self.device, non_blocking=True)
 
@@ -131,6 +141,7 @@ class Trainer:
         return obj
 
     def _compute_train_loss(self, batch) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        # 训练路径先构建 final mixer cache，再运行 final mixer 并交给 adapter/criterion。
         if not hasattr(self.model, "build_final_mixer_cache"):
             raise AttributeError(
                 "Model must provide build_final_mixer_cache(batch)."
@@ -173,6 +184,7 @@ class Trainer:
         return loss_dict, loss_dict["total_loss"]
 
     def train_step(self, batch) -> tuple[Dict[str, float], bool]:
+        # 单次训练迭代：前向、loss、反向、梯度裁剪、optimizer/scheduler step。
         if self.optimizer is None:
             raise RuntimeError("Optimizer is None, cannot run train_step().")
 
@@ -188,6 +200,7 @@ class Trainer:
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.optimizer)
 
+            # 裁剪整体梯度范数，避免异常 batch 导致参数更新过大。
             if self.cfg.grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
@@ -213,6 +226,7 @@ class Trainer:
         return stats, did_step
 
     def _forward_val_outputs(self, batch) -> Dict[str, torch.Tensor]:
+        # 验证时统一走 TTA 包装；未启用 TTA 时等价于普通推理。
         use_amp = self.cfg.use_amp and self.device.type == "cuda"
         with autocast(device_type=self.device.type, enabled=use_amp):
             outputs = inference_with_tta(self.model, batch, tta_cfg=self.cfg.tta_cfg)
@@ -248,6 +262,7 @@ class Trainer:
         return float(sum(values) / len(values))
 
     def register_log_getter(self, fn):
+        # 注册额外日志函数；函数输入 trainer，输出可记录的 dict。
         if fn is None:
             return
         self._log_getters.append(fn)
@@ -279,6 +294,7 @@ class Trainer:
         dataloader,
         force: bool = False,
     ) -> None:
+        # 从数据集 classes 中预先构建文本特征缓存，避免每个 batch 重复编码。
         if dataloader is None:
             return
 
@@ -305,6 +321,7 @@ class Trainer:
         return None
 
     def _collect_extra_log_vars(self) -> Dict[str, object]:
+        # 调用所有已注册 getter，并过滤为日志系统可打印的标量。
         out: Dict[str, object] = {}
         for fn in self._log_getters:
             try:
@@ -333,6 +350,7 @@ class Trainer:
         data_time: float,
         iter_time: float,
     ) -> None:
+        # 更新训练日志快照，包含 ETA、学习率、显存、loss 滑动平均等。
         self._data_time_history.append(float(data_time))
         self._iter_time_history.append(float(iter_time))
         self._train_stat_history.append(dict(stats))
@@ -366,6 +384,7 @@ class Trainer:
         data_time: float,
         iter_time: float,
     ) -> None:
+        # 更新验证日志快照，包含验证进度、ETA 和指标滑动平均。
         self._val_data_time_history.append(float(data_time))
         self._val_iter_time_history.append(float(iter_time))
         self._val_metric_history.append(dict(metric_stats_snapshot))
@@ -393,6 +412,7 @@ class Trainer:
         }
 
     def _set_dataloader_cycle(self, cycle_index: int) -> None:
+        # 分布式/自定义 sampler 若支持 set_epoch，则按数据轮次设置随机状态。
         if self.train_dataloader is None:
             return
 
@@ -405,6 +425,7 @@ class Trainer:
             batch_sampler.set_epoch(cycle_index)
 
     def _build_train_iterator(self) -> None:
+        # resume 后根据 global_iter 跳过当前数据轮中已消费的 batch。
         if self.train_dataloader is None:
             self._train_iterator = None
             return
@@ -431,6 +452,7 @@ class Trainer:
                 self._train_iterator = iter(self.train_dataloader)
 
     def _next_train_batch(self):
+        # 训练 dataloader 迭代完后自动重建 iterator，形成 iter-based 训练。
         if self.train_dataloader is None:
             raise RuntimeError("train_dataloader is None, cannot fetch training batch.")
 
@@ -449,6 +471,7 @@ class Trainer:
         self,
         train_stats: Dict[str, float],
     ) -> Path:
+        # 先保存训练状态；如果随后验证，会再把验证指标写回 checkpoint 元信息。
         return self.checkpoint_manager.save_before_validation(
             global_iter=self.global_iter,
             model=self.model,
@@ -478,6 +501,7 @@ class Trainer:
 
     @torch.no_grad()
     def val(self) -> Dict[str, float]:
+        # 完整验证循环：推理、累计 evaluator、可视化、调用 hook、返回指标。
         if self.val_dataloader is None:
             return {}
 
@@ -540,6 +564,7 @@ class Trainer:
         return stats
 
     def train(self):
+        # iter-based 训练主循环，直到 global_iter 达到 max_iters。
         if self.train_dataloader is None:
             raise RuntimeError("train_dataloader is None, cannot run train().")
 

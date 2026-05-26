@@ -13,6 +13,7 @@ from ..models.task_modes import OUTPUT_KEYS
 TensorDict = Dict[str, torch.Tensor]
 
 
+# 语义分割训练损失：组合 final BCE/Dice/CE、presence loss 和中间层辅助 loss。
 class SemanticCriterion(nn.Module):
     def __init__(self, cfg: Optional[SemanticCriterionConfig] = None):
         super().__init__()
@@ -25,6 +26,7 @@ class SemanticCriterion(nn.Module):
         chunk_class_ids: Optional[Sequence[int]] = None,
         reduction: str = "mean",
     ) -> TensorDict:
+        # 目前只支持 mean reduction；返回 dict 便于 Trainer 同时记录多个 loss 项。
         if reduction != "mean":
             raise ValueError(
                 f"SemanticCriterion only supports reduction='mean', got {reduction!r}."
@@ -43,6 +45,7 @@ class SemanticCriterion(nn.Module):
         outputs: TensorDict,
         targets: TensorDict,
     ) -> TensorDict:
+        # 主损失流程：准备 target/mask，计算 final loss、presence loss 和辅助层 loss。
         semantic_logits = self._extract_required_tensor(
             outputs=outputs,
             key=OUTPUT_KEYS.semantic_logits,
@@ -215,6 +218,7 @@ class SemanticCriterion(nn.Module):
         ndim: int,
         shape_name: str,
     ) -> torch.Tensor:
+        # 取出必须存在的 Tensor，统一做缺失和维度检查。
         tensor = outputs.get(key, None)
         if tensor is None:
             raise ValueError(f"SemanticCriterion expects outputs['{key}'].")
@@ -225,6 +229,7 @@ class SemanticCriterion(nn.Module):
         return tensor
 
     def _extract_label_map(self, targets: TensorDict) -> torch.Tensor:
+        # 从 targets 中取语义标签图，兼容 [B,H,W] 和 [B,1,H,W]。
         if "label_map" not in targets:
             raise ValueError("SemanticCriterion expects targets['label_map'].")
 
@@ -264,6 +269,7 @@ class SemanticCriterion(nn.Module):
         class_ids: Sequence[int],
         num_channels: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 将单通道标签图转为 one-vs-rest 二值 target: [B, C, H, W]。
         if len(class_ids) != num_channels:
             raise ValueError(
                 f"class_ids length mismatch: expected {num_channels}, "
@@ -295,6 +301,7 @@ class SemanticCriterion(nn.Module):
         target: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
+        # 判断每张图每个类别是否至少有一个有效前景像素。
         target_valid = target * valid_mask.to(dtype=target.dtype)
         fg_pixels_per_pair = target_valid.flatten(2).sum(dim=2)
         return fg_pixels_per_pair > 0
@@ -304,6 +311,7 @@ class SemanticCriterion(nn.Module):
         target: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # presence target 是图像级类别存在标签，供 presence_logits 做 BCE。
         if target.dim() != 4:
             raise ValueError(
                 f"target must be [B, C, H, W], got {tuple(target.shape)}."
@@ -329,6 +337,7 @@ class SemanticCriterion(nn.Module):
         presence_target: torch.Tensor,
         presence_valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, TensorDict]:
+        # 计算最后一层或多层 presence BCE，并返回日志用的分项 loss。
         presence_logits_layers = outputs.get(OUTPUT_KEYS.presence_logits_layers, None)
 
         if presence_logits_layers is None:
@@ -382,6 +391,7 @@ class SemanticCriterion(nn.Module):
         presence_logits_layers: torch.Tensor,
         num_layers: int,
     ) -> torch.Tensor:
+        # presence_layer_loss_weights 可按层配置；未配置时均匀分配。
         weights = self.cfg.presence_layer_loss_weights
         if weights is None:
             return presence_logits_layers.new_full(
@@ -429,6 +439,7 @@ class SemanticCriterion(nn.Module):
         semantic_logits: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
+        # 对 ignore 区域用 SAM3 semantic logits 构造 teacher，约束 final logits 不乱飘。
         if final_logits.shape != semantic_logits.shape:
             raise ValueError(
                 "final_logits and semantic_logits must have the same shape for "
@@ -465,6 +476,7 @@ class SemanticCriterion(nn.Module):
         ce_label_map: torch.Tensor,
         ce_class_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        # final 输出的三类基础 mask loss：BCE、Dice、CE。
         if present_pair_mask.any():
             loss_bce = self._binary_cross_entropy_present_balanced_mean(
                 logits=logits,
@@ -499,6 +511,7 @@ class SemanticCriterion(nn.Module):
         clamp_min: float,
         clamp_max: float,
     ) -> torch.Tensor:
+        # 根据当前 batch 中每个类别前景像素数构造动态类别平衡权重。
         target_valid = target * valid_mask.to(dtype=target.dtype)
         fg_pixels = target_valid.flatten(2).sum(dim=2)
 
@@ -521,6 +534,7 @@ class SemanticCriterion(nn.Module):
         present_pair_mask: torch.Tensor,
         class_weights: torch.Tensor,
     ) -> torch.Tensor:
+        # 只对当前图中存在的类别计算 BCE，并乘以动态类别平衡权重。
         pair_mask_4d = present_pair_mask[:, :, None, None]
         effective_mask = valid_mask & pair_mask_4d
 
@@ -546,6 +560,7 @@ class SemanticCriterion(nn.Module):
         valid_mask: torch.Tensor,
         present_pair_mask: torch.Tensor,
     ) -> torch.Tensor:
+        # Dice loss 只在存在类别上求平均，关注预测区域和真实区域的重叠。
         prob = logits.sigmoid()
         prob = prob * valid_mask.to(dtype=prob.dtype)
         target = target * valid_mask.to(dtype=target.dtype)
@@ -569,6 +584,7 @@ class SemanticCriterion(nn.Module):
         label_map: torch.Tensor,
         class_ids: Sequence[int],
     ) -> torch.Tensor:
+        # 将原始类别 id 映射到当前 class_ids 的连续 CE 类别索引。
         ce_label_map = torch.full_like(
             label_map,
             fill_value=int(self.cfg.ignore_index),
@@ -586,6 +602,7 @@ class SemanticCriterion(nn.Module):
         present_pair_mask: torch.Tensor,
         ce_class_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, int]:
+        # CE 按图逐张计算，因为每张图实际 present 的类别集合可能不同。
         if logits.shape[0] != ce_label_map.shape[0]:
             raise ValueError(
                 "Batch mismatch between logits and ce_label_map: "
@@ -715,6 +732,7 @@ class SemanticCriterion(nn.Module):
         ce_label_map: torch.Tensor,
         ce_class_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, TensorDict]:
+        # 对 final mixer 的中间 mask 层添加辅助监督，帮助深层融合更稳定。
         mask_logits_layers = outputs.get(OUTPUT_KEYS.mask_logits_layers, None)
 
         if mask_logits_layers is None:
@@ -781,6 +799,7 @@ class SemanticCriterion(nn.Module):
         mask_logits_layers: torch.Tensor,
         num_aux_layers: int,
     ) -> torch.Tensor:
+        # mask_layer_weights 需要与辅助层数量一致；None 时各辅助层权重为 1。
         weights = self.cfg.mask_layer_weights
         if weights is None:
             return mask_logits_layers.new_ones(num_aux_layers)
@@ -793,6 +812,7 @@ class SemanticCriterion(nn.Module):
         return mask_logits_layers.new_tensor(list(weights))
 
 
+# 混合任务损失暂未实现，占位用于保持构建接口一致。
 class HybridCriterion(nn.Module):
     def __init__(self):
         super().__init__()
