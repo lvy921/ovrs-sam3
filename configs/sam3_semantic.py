@@ -1,45 +1,50 @@
-# 继承基础配置文件。后面的同名配置会覆盖或补充这些 base 配置。
+# 提供训练参数
+
+# 继承基础配置文件。
+# 后面的同名配置会覆盖或补充这些 base 配置。
 _base_ = [
     "./_base_/runtime.py",
     "./_base_/optimizer.py",
     "./_base_/schedule.py",
     "./_base_/visualization.py",
     "./datasets/isaid.py",
-]
 
-# 模型配置：由 tools/train.py 中的 build_training_components(**cfg.model) 读取。
+# 被model_builder.py用来构建model和criterion
+# 被build_training_components()调用
 model = dict(
-    # 当前配置只启用语义分割任务路径。
+    # 定义模式: 当前配置只启用语义分割任务路径。
     task_mode="semantic",
-    # SAM3 文本编码器使用的 BPE 词表路径。
+    # SAM3 文本编码器使用的 BPE 词表路径, BPE就是分词用的词表文件
     bpe_path="assets/bpe_simple_vocab_16e6.txt.gz",
     # 本地 SAM3 预训练权重路径；load_from_hf=False 时使用该文件。
     checkpoint_path="weights/sam3.pt",
     # 是否从 Hugging Face 下载 SAM3 权重。
     load_from_hf=False,
-    # 模型构建和训练默认使用的设备。
+    # 模型构建和训练默认使用的设备, 表示模型放在gpu上
     device="cuda",
     # False 表示构建后进入 train() 模式；True 则进入 eval() 模式。
     eval_mode=False,
-    # 是否启用 torch.compile 编译模型子模块。
+    # 是否启用 torch.compile 编译模型子模块
+    # torch.compile 是 PyTorch 的运行时优化功能，可能让模型跑得更快，但也可能带来调试困难或兼容问题
     compile=False,
     # 类别数较多时，将 prompt 按 chunk 分批处理以降低显存占用。
     prompt_chunk_size=8,
 
-    # OpenCLIP 配置：提供遥感图像和类别文本的 CLIP 特征。
+    # OpenCLIP 配置：提供遥感图像和类别文本的 CLIP 特征
     openclip_cfg=dict(
         # 启用 OpenCLIP 分支；当前 final mixer 依赖该分支。
         enabled=True,
-        # 使用的 OpenCLIP 模型结构名称。
+        # 使用的 OpenCLIP 模型结构名称。--> 图像编码器结构 vit - large(大) -14(patch_size)
         model_name="ViT-L-14",
         # RemoteCLIP 预训练权重路径。
         pretrained="weights/RemoteCLIP-ViT-L-14.pt",
-        # 图像编码器默认输出特征图，而不是全局向量。
+        # 普通clip输出整张图向量,这里指输出特征图, 因为要知道每一个位置的信息
         default_output="feat_map",
 
-        # 使用 MaskCLIP 风格的图像特征输出。
+        # 使用 MaskCLIP 风格提取密集特征
         image_encoder_mode="maskclip",
-        # 跳过最后若干层，以保留更适合密集预测的视觉特征。
+        # 跳过最后1层，以保留更适合密集预测的视觉特征。
+        # clip最后层偏向全局语义, 对密集分割不一定合适
         maskclip_skip_last_layers=1,
 
         # 类别名会填入这些模板中，形成 CLIP 文本 prompt。
@@ -60,7 +65,7 @@ model = dict(
         # 当前语义训练路径要求 final mixer 必须开启。
         enabled=True,
 
-        # 每个类别维护的 class token 数量。
+        # 每个类别维护的 class token 数量。即每个类别用32个向量表示
         num_class_tokens=32,
         # mask embedding 融合层数。
         fusion_layers=4,
@@ -74,6 +79,7 @@ model = dict(
         # CLIP-SAM 特征构建配置；当前新结构中主要用于配置兼容。
         clip_sam_feature_cfg=dict(
             enabled=True,
+            # 不额外加入clip图像残差
             use_image_residual=False,
         ),
 
@@ -90,7 +96,7 @@ model = dict(
             source="mean_class_tokens",
         ),
 
-        # semantic prior 用 presence logit 和 softmax mask 构造先验嵌入。
+        # semantic prior(粗略分割结果) 用 presence logit 和 softmax mask 构造先验嵌入。
         semantic_prior_cfg=dict(
             type="presence_signed_softmax",
             # 控制 mask logits 缩放强度的温度参数。
@@ -105,10 +111,11 @@ model = dict(
         ),
 
         # mask head 通过 mask embedding 与 class_code 点积生成类别 mask。
+        # 结果是: 这个像素属于这个类别的分数
         mask_head_cfg=dict(
             type="mask_embed_dot_class_code",
             direct_dot=True,
-            # class token 关注空间特征前，对特征图做池化的步长。
+            # class token 关注空间特征前，对特征图做池化的步长, 用于下采样, 减小计算量。
             class_feature_pool_stride=4,
         ),
     ),
@@ -121,11 +128,13 @@ model = dict(
         trainable_modules=[
             "core.final_mixer",
         ],
-        # train_adapters_only=True 时，该列表通常为空。
+        # train_adapters_only=True 时，该列表通常为空
+        # 在这个模式下不需要列出来,因为代码已经冻结了整个模型
         frozen_modules=[],
     ),
 
     # 输出适配器配置；空字典表示使用默认 SemanticSegAdapter 参数。
+    # adapter 的作用是把模型原始输出转换成训练/验证需要的格式
     adapter_cfg=dict(),
 
     # 语义分割损失函数配置。
@@ -133,15 +142,16 @@ model = dict(
         # 标签中值为 255 的像素不参与损失和指标计算。
         ignore_index=255,
 
-        # final 输出的 BCE、Dice、CE 损失权重。
+        # final 输出的 BCE、Dice、CE 损失权重, 是loss算出来之后再加到总loss里的权重。
         final_bce_weight=0.4,
         final_dice_weight=1.0,
         final_ce_weight=0.4,
         # ignore 区域对应 BCE 项的权重。
         final_ignore_bce_weight=0.0,
 
-        # presence 分类损失权重，以及中间层 presence 辅助损失权重。
+        # presence 分类损失权重
         presence_loss_weight=1.0,
+        # final mixer 有多层，每一层都可能输出 presence, 这些是中间层 presence 辅助损失权重
         presence_layer_loss_weights=[0.02, 0.05, 0.1, 0.2],
 
         # 中间 mask 层辅助损失的总体权重和逐层权重。
@@ -156,6 +166,9 @@ model = dict(
         ce_class_balance_clamp_min=0.2,
         ce_class_balance_clamp_max=5.0,
 
+        # dice loss主要按类别/样本 pair做平均, 没有根据像素数量给没一个类别乘动态权重, 
+        # 所以不需要类别均衡权重的裁剪范围
+        
         # 数值稳定项，避免除零或 log(0)。
         eps=1e-6,
     ),
@@ -206,7 +219,9 @@ optim_wrapper = dict(
             custom_keys={
                 # final mixer 是主要训练模块，因此使用更高学习率。
                 "core.final_mixer": dict(
+                    # 学习率乘4
                     lr_mult=4.0,
+                    # 权重衰减乘4
                     decay_mult=1.0,
                 ),
             },
@@ -219,12 +234,14 @@ param_scheduler = [
     dict(
         # 线性 warmup，训练初期从较小学习率逐步升高。
         type="LinearLR",
+        # 前1000 iter做warmup, 学习率从基础学习率的0.1慢慢升到正常值
         start_factor=0.1,
         total_iters=1000,
         end=0,
     ),
     dict(
         # 余弦退火调度，将学习率逐渐降到 eta_min。
+        # 后 19000 iter 做余弦退火, 学习率慢慢降到 1e-6
         type="CosineAnnealingLR",
         T_max=19000,
         eta_min=1e-6,
@@ -239,11 +256,13 @@ train_cfg = dict(
     save_interval=1000,
     # 验证间隔；这里等于 max_iters，表示主要在训练结束时验证。
     eval_interval=20000,
-    # 日志平滑窗口大小。
+    # 日志平滑窗口大小, 即日志统计最近20次的平均值。
     log_window_size=20,
     # 启用自动混合精度训练。
+    # 训练时不全都用 float32，而是让一部分计算用更低精度，比如 float16 / bfloat16
     use_amp=True,
     # 梯度裁剪阈值，防止梯度爆炸。
+    # 如果所有参数的梯度整体范数超过 0.1，就把它按比例缩小到 0.1 以内。
     grad_clip_norm=0.1,
     # 用于选择 best checkpoint 的监控指标。
     monitor="semantic.miou",
@@ -257,7 +276,7 @@ train_cfg = dict(
     device="cuda",
 )
 
-# 测试时增强配置；enabled=False 表示默认不启用 TTA。
+# 测试时增强(tta)配置；enabled=False 表示默认不启用 TTA。
 tta_cfg = dict(
     enabled=False,
     # 多尺度推理比例。
