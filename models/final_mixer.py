@@ -5,11 +5,16 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# 项目统一定义的输出 key，比如 final_logits、presence_logits 等
 from .task_modes import OUTPUT_KEYS
+# 窗口注意力模块，用在 mask embedding 和 CLIP-SAM feature 融合
 from .shifted_window_attention import ShiftedWindowAttention2D
 from .final_mixer_clip_sam import (
+    #  构建 low-res CLIP-SAM feature
     ClipSamFeatureInitializer,
+    # 把 low-res CLIP-SAM feature 上采样成 high-res
     CrossGuidedClipSamUpsampler,
+    # 根据 CLIP 粗语义生成 coarse logits / coarse pred，并增强 clip_sam_feature_high
     ClipCoarseMaskEmbedder,
 )
 
