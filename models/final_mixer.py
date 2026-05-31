@@ -979,6 +979,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         )
 
         # 在 CLIP 原生网格上，将 CLIP 图像/文本特征和 SAM3 class token 对齐。
+        # from .final_mixer_clip_sam import
         self.clip_sam_initializer = ClipSamFeatureInitializer(
             clip_dim=self.clip_dim,
             sam_dim=self.sam_dim,
@@ -987,6 +988,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         )
 
         # 把低分辨率 CLIP-SAM feature 上采样到 SAM3 mask 分辨率。
+        # from .final_mixer_clip_sam import
         self.clip_sam_upsampler = CrossGuidedClipSamUpsampler(
             hidden_dim=self.sam_dim,
             num_heads=self.num_heads,
@@ -996,6 +998,7 @@ class ClassTokenSemanticFinalMixer(nn.Module):
         )
 
         # 生成 CLIP coarse mask，并把 coarse 类别 embedding 注入 CLIP-SAM high feature。
+        # from .final_mixer_clip_sam import
         self.clip_coarse_embedder = ClipCoarseMaskEmbedder(
             clip_dim=self.clip_dim,
             sam_dim=self.sam_dim,
