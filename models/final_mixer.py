@@ -876,22 +876,36 @@ class ClassTokenSemanticFinalMixer(nn.Module):
 
     def __init__(
         self,
+        # D_sam
         sam_dim: int,
+        # D_clip
         clip_dim: int,
+        # Q
         num_class_tokens: int = 32,
         num_heads: int = 8,
+        # L
         fusion_layers: int = 4,
         dropout: float = 0.1,
+        # 类别是否存在
         presence_enabled: bool = True,
+        # mask logits 的温度/缩放系数
         tau_mask: float = 16.0,
+        # 是否启用 CLIP-SAM feature 分支
         clip_sam_feature_enabled: bool = True,
+        # 是否启用 CLIP-SAM 特征上采样模块
         clip_sam_upsample_enabled: bool = True,
+
+        # 是“CLIP-SAM 特征上采样”用的, 发生在 final mixer 多层融合之前。
         clip_sam_upsample_window_size: int = 8,
         clip_sam_upsample_shift_size: int = 4,
         clip_sam_upsample_dropout: float = 0.1,
+
+        # 是“每层 MaskEmbeddingFusionLayer 融合 mask_embed”用的, 发生在 final mixer 内部，每层都会用。
         window_size: int = 8,
         shift_size: int = 4,
         window_dropout: float = 0.1,
+
+        # “class token 读空间特征前的池化倍率”, 主要影响 class_to_feature_attn 和 presence 判断。
         class_feature_pool_stride: int = 4,
     ) -> None:
         super().__init__()
