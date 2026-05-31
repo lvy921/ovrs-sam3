@@ -1270,11 +1270,19 @@ class ClassTokenSemanticFinalMixer(nn.Module):
 
     def forward(
         self,
+        # sam3 的 原始粗分割语义logits: [B,C,H,W]
         semantic_logits: torch.Tensor,
+        # 每个类别的 class token 表示: [B, C, Q, D_sam]
+        # Q = 每个类别几个 class token，也就是 num_class_tokens
         class_tokens: torch.Tensor,
+        # CLIP / RemoteCLIP 的原生图像特征图: [B, D_clip, Hc, Wc]
         clip_image_feat_map_native: torch.Tensor,
+        # CLIP / RemoteCLIP 的文本特征 token: [C, K, D_clip]
+        # K = 每个类别的 prompt/template 数量
         clip_text_tokens_native: torch.Tensor,
+        # SAM3 的高分辨率图像特征图: [B, D_sam, H, W]
         sam3_feature_high: torch.Tensor,
+        # CLIP 图像特征图的网格尺寸: (Hc, Wc)
         clip_grid_hw: tuple[int, int],
     ) -> Dict[str, torch.Tensor]:
         # 主流程：构建 CLIP-SAM 特征、逐层融合、输出最终 logits 与中间层结果。
